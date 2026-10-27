@@ -41,5 +41,6 @@ the Linux memory management.
    soft-dirty
    transhuge
    userfaultfd
+   young_bitmap
    zswap
    kho

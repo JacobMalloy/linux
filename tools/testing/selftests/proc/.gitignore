@@ -20,6 +20,7 @@
 /proc-uptime-001
 /proc-uptime-002
 /proc-pidns
+/proc-young-bitmap
 /read
 /self
 /setns-dcache

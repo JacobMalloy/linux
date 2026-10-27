@@ -1935,6 +1935,356 @@ const struct file_operations proc_clear_refs_operations = {
 	.llseek		= noop_llseek,
 };
 
+/*
+ * /proc/pid/young_bitmap - per virtual page accessed bits
+ *
+ * The file position is a virtual page number (virtual address / PAGE_SIZE)
+ * and the data is a bitmap with one bit per page: bit (n % 8) of byte
+ * (n / 8) describes virtual page (pos + n).  A read or write of count bytes
+ * thus covers count * 8 pages and advances the file position by that many
+ * pages.
+ *
+ * Reading tests and clears the accessed bit of every page in the range:
+ * it reports a 1 for every page whose page table entry is present and had
+ * its accessed bit set (or that a secondary MMU reported as young), and a
+ * 0 otherwise, including for unmapped addresses, then clears the bit.
+ *
+ * Writing a bitmap in the same format only clears the accessed bit of the
+ * pages whose bit is set, without reporting anything.
+ *
+ * Only this process's page table entry is cleared; other mappings of the
+ * same page are left alone.  Hugetlb entries are reported but never
+ * cleared.  A PMD-mapped THP has a single accessed bit, so it is reported
+ * for, and cleared by, all of its pages.
+ *
+ * If /proc/pid/young_bitmap_flush is 1, a read or write also flushes the
+ * process's TLB entries once it has cleared any accessed bit, so that
+ * subsequent accesses are guaranteed to set the bit again.  Otherwise the
+ * TLB is left alone and stale entries may hide accesses until they are
+ * evicted.
+ */
+#define YOUNG_BITMAP_CHUNK	PAGE_SIZE	/* bitmap bytes per walk */
+
+struct young_bitmap_walk {
+	unsigned long start;	/* address of the page for bit 0 */
+	unsigned long *bitmap;
+	bool select;		/* only clear pages whose bit is set */
+	bool flush;		/* flush TLBs, incl. secondary MMUs */
+	bool cleared;		/* an accessed bit was cleared */
+};
+
+static inline unsigned long young_bitmap_idx(struct young_bitmap_walk *yw,
+					     unsigned long addr)
+{
+	return (addr - yw->start) >> PAGE_SHIFT;
+}
+
+static void young_bitmap_set(struct young_bitmap_walk *yw,
+			     unsigned long addr, unsigned long end)
+{
+	for (; addr < end; addr += PAGE_SIZE)
+		__set_bit_le(young_bitmap_idx(yw, addr), yw->bitmap);
+}
+
+static bool young_bitmap_any(struct young_bitmap_walk *yw,
+			     unsigned long addr, unsigned long end)
+{
+	unsigned long last = young_bitmap_idx(yw, end);
+
+	return find_next_bit_le(yw->bitmap, last,
+				young_bitmap_idx(yw, addr)) < last;
+}
+
+static bool young_bitmap_clear_secondary(struct young_bitmap_walk *yw,
+		struct mm_struct *mm, unsigned long start, unsigned long end)
+{
+	if (yw->flush)
+		return mmu_notifier_clear_flush_young(mm, start, end);
+	return mmu_notifier_clear_young(mm, start, end);
+}
+
+static int young_bitmap_pmd_range(pmd_t *pmd, unsigned long addr,
+				  unsigned long end, struct mm_walk *walk)
+{
+	struct young_bitmap_walk *yw = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	struct folio *folio;
+	pte_t *pte, ptent;
+	spinlock_t *ptl;
+	unsigned long idx;
+	bool young;
+
+	if (yw->select && !young_bitmap_any(yw, addr, end))
+		return 0;
+
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (ptl) {
+		pmd_t pmde = pmdp_get(pmd);
+
+		if (pmd_present(pmde)) {
+			young = false;
+			if (pmdp_test_and_clear_young(vma, addr & HPAGE_PMD_MASK,
+						      pmd)) {
+				young = true;
+				yw->cleared = true;
+				/* Keep reclaim from treating the folio as cold */
+				folio = vm_normal_folio_pmd(vma, addr, pmde);
+				if (folio)
+					folio_set_young(folio);
+			}
+			young |= young_bitmap_clear_secondary(yw, walk->mm,
+							      addr, end);
+			if (young && !yw->select)
+				young_bitmap_set(yw, addr, end);
+		}
+		spin_unlock(ptl);
+		return 0;
+	}
+
+	pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	if (!pte) {
+		walk->action = ACTION_AGAIN;
+		return 0;
+	}
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		idx = young_bitmap_idx(yw, addr);
+		if (yw->select && !test_bit_le(idx, yw->bitmap))
+			continue;
+
+		ptent = ptep_get(pte);
+		if (!pte_present(ptent))
+			continue;
+
+		young = false;
+		if (ptep_test_and_clear_young(vma, addr, pte)) {
+			young = true;
+			yw->cleared = true;
+			/* Keep reclaim from treating the folio as cold */
+			folio = vm_normal_folio(vma, addr, ptent);
+			if (folio)
+				folio_set_young(folio);
+		}
+		young |= young_bitmap_clear_secondary(yw, walk->mm, addr,
+						      addr + PAGE_SIZE);
+		if (young && !yw->select)
+			__set_bit_le(idx, yw->bitmap);
+	}
+	pte_unmap_unlock(pte - 1, ptl);
+	cond_resched();
+	return 0;
+}
+
+#ifdef CONFIG_HUGETLB_PAGE
+static int young_bitmap_hugetlb_range(pte_t *ptep, unsigned long hmask,
+				      unsigned long addr, unsigned long end,
+				      struct mm_walk *walk)
+{
+	struct young_bitmap_walk *yw = walk->private;
+	spinlock_t *ptl;
+	pte_t pte;
+
+	if (yw->select)
+		return 0;
+
+	ptl = huge_pte_lock(hstate_vma(walk->vma), walk->mm, ptep);
+	pte = huge_ptep_get(walk->mm, addr, ptep);
+	if (pte_present(pte) && pte_young(pte))
+		young_bitmap_set(yw, addr, end);
+	spin_unlock(ptl);
+	return 0;
+}
+#else
+#define young_bitmap_hugetlb_range	NULL
+#endif
+
+static const struct mm_walk_ops young_bitmap_ops = {
+	.pmd_entry	= young_bitmap_pmd_range,
+	.hugetlb_entry	= young_bitmap_hugetlb_range,
+	.walk_lock	= PGWALK_RDLOCK,
+};
+
+/*
+ * Common driver for reads and writes: walk the bitmap in chunks of
+ * YOUNG_BITMAP_CHUNK bytes, starting at virtual page @pos.
+ */
+static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
+			       size_t count, loff_t *ppos, bool write)
+{
+	struct mm_struct *mm = file->private_data;
+	struct young_bitmap_walk yw = { .select = write };
+	unsigned long start, end, npages;
+	ssize_t done = 0;
+	size_t len;
+	int ret = 0;
+
+	if (!mm || !mmget_not_zero(mm))
+		return 0;
+
+	if (!count || *ppos < 0 || *ppos > (ULONG_MAX >> PAGE_SHIFT))
+		goto out_mm;
+
+	yw.bitmap = kmalloc(YOUNG_BITMAP_CHUNK, GFP_KERNEL);
+	ret = -ENOMEM;
+	if (!yw.bitmap)
+		goto out_mm;
+
+	ret = mmap_read_lock_killable(mm);
+	if (ret)
+		goto out_free;
+	start = untagged_addr_remote(mm, (unsigned long)*ppos << PAGE_SHIFT);
+	mmap_read_unlock(mm);
+
+	yw.flush = mm_flags_test(MMF_YOUNG_BITMAP_FLUSH, mm);
+
+	while (count && start < mm->task_size) {
+		len = min_t(size_t, count, YOUNG_BITMAP_CHUNK);
+		npages = len * BITS_PER_BYTE;
+		end = start + (npages << PAGE_SHIFT);
+		if (end < start || end > mm->task_size)
+			end = mm->task_size;
+
+		if (write) {
+			ret = -EFAULT;
+			if (copy_from_user(yw.bitmap, ubuf, len))
+				break;
+		} else {
+			memset(yw.bitmap, 0, len);
+		}
+
+		yw.start = start;
+		if (!write || young_bitmap_any(&yw, start, end)) {
+			ret = mmap_read_lock_killable(mm);
+			if (ret)
+				break;
+			ret = walk_page_range(mm, start, end,
+					      &young_bitmap_ops, &yw);
+			mmap_read_unlock(mm);
+			if (ret)
+				break;
+		}
+
+		if (!write && copy_to_user(ubuf, yw.bitmap, len)) {
+			ret = -EFAULT;
+			break;
+		}
+
+		ubuf += len;
+		count -= len;
+		done += len;
+		if (end == mm->task_size)
+			break;
+		start = end;
+	}
+
+	if (yw.flush && yw.cleared)
+		flush_tlb_mm(mm);
+
+	*ppos += (loff_t)done * BITS_PER_BYTE;
+	if (done)
+		ret = done;
+
+out_free:
+	kfree(yw.bitmap);
+out_mm:
+	mmput(mm);
+	return ret;
+}
+
+static ssize_t young_bitmap_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	return young_bitmap_rw(file, buf, count, ppos, false);
+}
+
+static ssize_t young_bitmap_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return young_bitmap_rw(file, (char __user *)buf, count, ppos, true);
+}
+
+static int __young_bitmap_open(struct inode *inode, struct file *file,
+			       unsigned int mode)
+{
+	struct mm_struct *mm;
+
+	mm = proc_mem_open(inode, mode);
+	if (IS_ERR_OR_NULL(mm))
+		return mm ? PTR_ERR(mm) : -ESRCH;
+	file->private_data = mm;
+	return 0;
+}
+
+/* Both reading and writing modify the page tables. */
+static int young_bitmap_open(struct inode *inode, struct file *file)
+{
+	return __young_bitmap_open(inode, file, PTRACE_MODE_ATTACH);
+}
+
+static int young_bitmap_flush_open(struct inode *inode, struct file *file)
+{
+	return __young_bitmap_open(inode, file,
+				   (file->f_mode & FMODE_WRITE) ?
+				   PTRACE_MODE_ATTACH : PTRACE_MODE_READ);
+}
+
+static int young_bitmap_release(struct inode *inode, struct file *file)
+{
+	struct mm_struct *mm = file->private_data;
+
+	if (mm)
+		mmdrop(mm);
+	return 0;
+}
+
+const struct file_operations proc_young_bitmap_operations = {
+	.llseek		= mem_lseek,
+	.read		= young_bitmap_read,
+	.write		= young_bitmap_write,
+	.open		= young_bitmap_open,
+	.release	= young_bitmap_release,
+};
+
+static ssize_t young_bitmap_flush_read(struct file *file, char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct mm_struct *mm = file->private_data;
+	char buffer[4];
+	int len;
+
+	len = scnprintf(buffer, sizeof(buffer), "%d\n",
+			mm_flags_test(MMF_YOUNG_BITMAP_FLUSH, mm));
+	return simple_read_from_buffer(buf, count, ppos, buffer, len);
+}
+
+static ssize_t young_bitmap_flush_write(struct file *file,
+					const char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	struct mm_struct *mm = file->private_data;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint_from_user(buf, count, 10, &val);
+	if (ret)
+		return ret;
+	if (val > 1)
+		return -EINVAL;
+
+	if (val)
+		mm_flags_set(MMF_YOUNG_BITMAP_FLUSH, mm);
+	else
+		mm_flags_clear(MMF_YOUNG_BITMAP_FLUSH, mm);
+	return count;
+}
+
+const struct file_operations proc_young_bitmap_flush_operations = {
+	.llseek		= noop_llseek,
+	.read		= young_bitmap_flush_read,
+	.write		= young_bitmap_flush_write,
+	.open		= young_bitmap_flush_open,
+	.release	= young_bitmap_release,
+};
+
 typedef struct {
 	u64 pme;
 } pagemap_entry_t;
