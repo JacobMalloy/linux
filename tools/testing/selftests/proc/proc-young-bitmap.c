@@ -93,10 +93,13 @@ int main(void)
 	ffd = open("/proc/self/young_bitmap_flush", O_RDWR);
 	assert(ffd >= 0);
 
-	/* flush knob: defaults to 0, accepts only 0 and 1 */
+	/* flags: default 0, 1 = flush TLB, 2 = mark folios young */
 	rv = pread(ffd, buf, sizeof(buf), 0);
 	assert(rv == 2 && !memcmp(buf, "0\n", 2));
-	assert(pwrite(ffd, "2", 1, 0) == -1 && errno == EINVAL);
+	assert(pwrite(ffd, "4", 1, 0) == -1 && errno == EINVAL);
+	assert(pwrite(ffd, "3", 1, 0) == 1);
+	rv = pread(ffd, buf, sizeof(buf), 0);
+	assert(rv == 2 && !memcmp(buf, "3\n", 2));
 	assert(pwrite(ffd, "1", 1, 0) == 1);
 	rv = pread(ffd, buf, sizeof(buf), 0);
 	assert(rv == 2 && !memcmp(buf, "1\n", 2));
@@ -202,6 +205,55 @@ int main(void)
 
 		assert(write(p2c[1], "x", 1) == 1);
 		assert(waitpid(pid, NULL, 0) == pid);
+	}
+
+	/*
+	 * Page tables whose PMD was not used since the last read are skipped:
+	 * touch one page in each of a few 2 MiB regions and check that exactly
+	 * those are reported, with and without marking folios young.
+	 */
+	{
+		const unsigned long big = 8 * 512;	/* 16 MiB of 4 KiB pages */
+		uint8_t *bmap = malloc(big / 8);
+		const char *flags[] = { "1", "3" };
+		char *area;
+		int f;
+
+		assert(bmap);
+		area = mmap(NULL, big * page_size, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		assert(area != MAP_FAILED);
+		madvise(area, big * page_size, MADV_NOHUGEPAGE);
+		for (i = 0; i < big; i++)
+			touch(area + i * page_size);
+
+		for (f = 0; f < 2; f++) {
+			assert(pwrite(ffd, flags[f], 1, 0) == 1);
+			read_bitmap(fd, area, bmap, big / 8);	/* reset */
+			read_bitmap(fd, area, bmap, big / 8);
+			for (i = 0; i < big; i++)
+				assert(!test_bit(bmap, i));
+
+			for (i = 700; i < big; i += 1500)
+				touch(area + i * page_size);
+			read_bitmap(fd, area, bmap, big / 8);
+			for (i = 0; i < big; i++)
+				assert(test_bit(bmap, i) == (i >= 700 && (i - 700) % 1500 == 0));
+		}
+		/*
+		 * A read of part of a PMD must not hide young PTEs from a
+		 * later read of the rest: read the area in 64-page pieces.
+		 */
+		for (i = 0; i < big; i += 300)
+			touch(area + i * page_size);
+		for (i = 0; i < big; i += 64)
+			read_bitmap(fd, area + i * page_size, bmap + i / 8, 8);
+		for (i = 0; i < big; i++)
+			assert(test_bit(bmap, i) == !(i % 300));
+
+		assert(pwrite(ffd, "1", 1, 0) == 1);
+		munmap(area, big * page_size);
+		free(bmap);
 	}
 
 	/* Positions past the address space read as EOF. */

@@ -1992,8 +1992,10 @@ enum {
 #define MMF_TOPDOWN		31	/* mm searches top down by default */
 #define MMF_TOPDOWN_MASK	BIT(MMF_TOPDOWN)
 
-/* Flush TLBs after clearing accessed bits via /proc/pid/young_bitmap */
+/* /proc/pid/young_bitmap: flush TLBs after clearing accessed bits */
 #define MMF_YOUNG_BITMAP_FLUSH	32
+/* /proc/pid/young_bitmap: mark folios young when clearing accessed bits */
+#define MMF_YOUNG_BITMAP_MARK	33
 
 #define MMF_INIT_LEGACY_MASK	(MMF_DUMP_FILTER_MASK |\
 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\

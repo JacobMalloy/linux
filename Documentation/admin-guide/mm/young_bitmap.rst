@@ -50,9 +50,7 @@ Common behaviour
 ================
 
 Only the page table entry of this process is cleared: other processes mapping
-the same page keep their accessed bits. When an accessed bit is cleared the
-page is marked young for reclaim (as idle page tracking does), so that
-reclaim does not consider the page cold because of the cleared bit.
+the same page keep their accessed bits.
 
 Limitations:
 
@@ -62,30 +60,46 @@ Limitations:
 * Hugetlb pages are reported but never cleared.
 * On architectures that group page table entries (for example arm64
   contiguous PTEs) clearing one entry may clear the whole group.
-* Reclaim and MGLRU also clear accessed bits, so a 0 may mean that the page
-  was accessed and then aged by the kernel.
+* Reclaim and MGLRU also clear accessed bits (MGLRU also clears those of
+  non-leaf entries), so a 0 may mean that the page was accessed and then aged
+  by the kernel. Without flag 2, clearing bits can in turn make reclaim treat
+  recently used pages as cold.
+* Pages that the kernel maps as accessed without the CPU touching them (for
+  example with ``MAP_POPULATE``) may be reported as accessed once, by a later
+  read.
 
-TLB flushing
-============
+Flags
+=====
 
-Clearing an accessed bit does not, by itself, remove the translation from the
-TLB, and while the translation stays cached the CPU may access the page
-without setting the accessed bit again. ``/proc/pid/young_bitmap_flush``
-controls whether a read or write of ``young_bitmap`` also flushes the TLB:
+``/proc/pid/young_bitmap_flush`` holds a combination of the following flags,
+written and read as a decimal number. The default is 0.
 
-``0`` (default)
-	The TLB is left alone. This is cheap, but accesses may be missed until
-	the TLB entries are evicted.
+``1`` (flush)
+	If a read or write cleared any accessed bit, the process's TLB entries
+	are flushed on all CPUs once it is done, and secondary MMUs are asked
+	to flush as well. Clearing an accessed bit does not by itself remove
+	the translation from the TLB, and while it stays cached the CPU may
+	access the page without setting the bit again; with this flag
+	subsequent accesses are guaranteed to set it.
 
-``1``
-	If the read or write cleared any accessed bit, the process's TLB
-	entries are flushed on all CPUs once it is done, and secondary MMUs are
-	asked to flush as well. Subsequent accesses are guaranteed to set the
-	accessed bit.
+	With flushing enabled, reads also use the accessed bit that the CPU
+	sets in non-leaf page middle directory entries (on architectures that
+	support it, such as x86) to skip page tables that were not used since
+	the previous read. The flush is what makes this reliable, since it
+	also drops cached paging-structure entries. It is not used when the
+	process has secondary MMUs (for example KVM), whose accesses do not
+	set that bit.
 
-The setting belongs to the process's address space, so it is shared by all
-threads and is not inherited across ``fork(2)``. Reading the file returns the
-current value.
+``2`` (mark young)
+	When an accessed bit is cleared, the page is also marked young for
+	reclaim (as idle page tracking does), so that reclaim does not consider
+	the page cold because of the cleared bit. This touches the
+	``struct page`` of every accessed page and is the most expensive part
+	of a read, so it is off by default; it only matters when the system is
+	reclaiming memory.
+
+The flags belong to the process's address space, so they are shared by all
+threads and are not inherited across ``fork(2)``.
 
 Example
 =======

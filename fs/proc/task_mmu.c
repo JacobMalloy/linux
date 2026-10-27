@@ -1957,19 +1957,34 @@ const struct file_operations proc_clear_refs_operations = {
  * cleared.  A PMD-mapped THP has a single accessed bit, so it is reported
  * for, and cleared by, all of its pages.
  *
- * If /proc/pid/young_bitmap_flush is 1, a read or write also flushes the
- * process's TLB entries once it has cleared any accessed bit, so that
- * subsequent accesses are guaranteed to set the bit again.  Otherwise the
- * TLB is left alone and stale entries may hide accesses until they are
- * evicted.
+ * /proc/pid/young_bitmap_flush holds flags:
+ *
+ * YOUNG_BITMAP_FLUSH: a read or write also flushes the process's TLB
+ * entries once it has cleared any accessed bit, so that subsequent accesses
+ * are guaranteed to set the bit again.  Otherwise the TLB is left alone and
+ * stale entries may hide accesses until they are evicted.  When flushing,
+ * reads also rely on the accessed bit of non-leaf PMDs (where the hardware
+ * sets it) to skip page tables that were not used since the previous read.
+ *
+ * YOUNG_BITMAP_MARK: folios whose accessed bit is cleared are marked young,
+ * so that reclaim does not treat them as cold because of the cleared bit.
+ * This costs an access to the struct page of every accessed page.
  */
 #define YOUNG_BITMAP_CHUNK	PAGE_SIZE	/* bitmap bytes per walk */
+
+#define YOUNG_BITMAP_FLUSH	1
+#define YOUNG_BITMAP_MARK	2
 
 struct young_bitmap_walk {
 	unsigned long start;	/* address of the page for bit 0 */
 	unsigned long *bitmap;
+	unsigned long read_start, read_end;	/* range of the whole read */
+	unsigned long pmd_cleared;	/* PMD range whose young bit we cleared */
 	bool select;		/* only clear pages whose bit is set */
 	bool flush;		/* flush TLBs, incl. secondary MMUs */
+	bool mark;		/* mark folios young for reclaim */
+	bool notifiers;		/* the mm has secondary MMUs */
+	bool skip_pmd;		/* skip PTE tables under old non-leaf PMDs */
 	bool cleared;		/* an accessed bit was cleared */
 };
 
@@ -1995,9 +2010,19 @@ static bool young_bitmap_any(struct young_bitmap_walk *yw,
 				young_bitmap_idx(yw, addr)) < last;
 }
 
+/* OR @bits, the bits of the 64-page group containing page @idx, into the bitmap */
+static inline void young_bitmap_store(struct young_bitmap_walk *yw,
+				      unsigned long idx, u64 bits)
+{
+	if (bits)
+		((__le64 *)yw->bitmap)[idx / 64] |= cpu_to_le64(bits);
+}
+
 static bool young_bitmap_clear_secondary(struct young_bitmap_walk *yw,
 		struct mm_struct *mm, unsigned long start, unsigned long end)
 {
+	if (!yw->notifiers)
+		return false;
 	if (yw->flush)
 		return mmu_notifier_clear_flush_young(mm, start, end);
 	return mmu_notifier_clear_young(mm, start, end);
@@ -2008,14 +2033,46 @@ static int young_bitmap_pmd_range(pmd_t *pmd, unsigned long addr,
 {
 	struct young_bitmap_walk *yw = walk->private;
 	struct vm_area_struct *vma = walk->vma;
+	const bool select = yw->select, mark = yw->mark;
+	bool cleared = false, young;
 	struct folio *folio;
 	pte_t *pte, ptent;
 	spinlock_t *ptl;
 	unsigned long idx;
-	bool young;
+	u64 bits = 0;
 
-	if (yw->select && !young_bitmap_any(yw, addr, end))
+	if (select && !young_bitmap_any(yw, addr, end))
 		return 0;
+
+	if (IS_ENABLED(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG) && yw->skip_pmd) {
+		pmd_t pmde = pmdp_get_lockless(pmd);
+
+		unsigned long pmd_start = addr & PMD_MASK;
+
+		/*
+		 * The hardware sets the accessed bit of a non-leaf PMD when it
+		 * walks through it, so if it is clear none of the PTEs below
+		 * was used since we last cleared it (the TLB flush at the end
+		 * of each read also drops cached paging-structure entries).
+		 * Several VMAs may share the PMD, so once we cleared it in
+		 * this read, walk the rest of it regardless.
+		 */
+		if (pmd_present(pmde) && !pmd_leaf(pmde) &&
+		    pmd_start != yw->pmd_cleared) {
+			if (!pmd_young(pmde))
+				return 0;
+			/*
+			 * Only clear it if this read covers, and thus clears,
+			 * every PTE below it; otherwise a later read of the
+			 * rest would skip PTEs that are still young.
+			 */
+			if (pmd_start >= yw->read_start &&
+			    pmd_start + PMD_SIZE <= yw->read_end) {
+				pmdp_test_and_clear_young(vma, addr, pmd);
+				yw->pmd_cleared = pmd_start;
+			}
+		}
+	}
 
 	ptl = pmd_trans_huge_lock(pmd, vma);
 	if (ptl) {
@@ -2027,14 +2084,14 @@ static int young_bitmap_pmd_range(pmd_t *pmd, unsigned long addr,
 						      pmd)) {
 				young = true;
 				yw->cleared = true;
-				/* Keep reclaim from treating the folio as cold */
-				folio = vm_normal_folio_pmd(vma, addr, pmde);
+				folio = mark ? vm_normal_folio_pmd(vma, addr, pmde) :
+					       NULL;
 				if (folio)
 					folio_set_young(folio);
 			}
 			young |= young_bitmap_clear_secondary(yw, walk->mm,
 							      addr, end);
-			if (young && !yw->select)
+			if (young && !select)
 				young_bitmap_set(yw, addr, end);
 		}
 		spin_unlock(ptl);
@@ -2046,29 +2103,40 @@ static int young_bitmap_pmd_range(pmd_t *pmd, unsigned long addr,
 		walk->action = ACTION_AGAIN;
 		return 0;
 	}
-	for (; addr != end; pte++, addr += PAGE_SIZE) {
-		idx = young_bitmap_idx(yw, addr);
-		if (yw->select && !test_bit_le(idx, yw->bitmap))
+	for (idx = young_bitmap_idx(yw, addr); addr != end;
+	     pte++, addr += PAGE_SIZE, idx++) {
+		if (select && !test_bit_le(idx, yw->bitmap))
 			continue;
 
 		ptent = ptep_get(pte);
 		if (!pte_present(ptent))
-			continue;
+			goto next;
 
 		young = false;
-		if (ptep_test_and_clear_young(vma, addr, pte)) {
+		if (pte_young(ptent) &&
+		    ptep_test_and_clear_young(vma, addr, pte)) {
 			young = true;
-			yw->cleared = true;
-			/* Keep reclaim from treating the folio as cold */
-			folio = vm_normal_folio(vma, addr, ptent);
+			cleared = true;
+			folio = mark ? vm_normal_folio(vma, addr, ptent) : NULL;
 			if (folio)
 				folio_set_young(folio);
 		}
 		young |= young_bitmap_clear_secondary(yw, walk->mm, addr,
 						      addr + PAGE_SIZE);
-		if (young && !yw->select)
-			__set_bit_le(idx, yw->bitmap);
+		if (young)
+			bits |= 1ULL << (idx % 64);
+next:
+		/* Store each completed group of 64 pages */
+		if (idx % 64 == 63) {
+			if (!select)
+				young_bitmap_store(yw, idx, bits);
+			bits = 0;
+		}
 	}
+	if (!select)
+		young_bitmap_store(yw, idx - 1, bits);
+	if (cleared)
+		yw->cleared = true;
 	pte_unmap_unlock(pte - 1, ptl);
 	cond_resched();
 	return 0;
@@ -2135,6 +2203,20 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 	mmap_read_unlock(mm);
 
 	yw.flush = mm_flags_test(MMF_YOUNG_BITMAP_FLUSH, mm);
+	yw.mark = mm_flags_test(MMF_YOUNG_BITMAP_MARK, mm);
+	yw.notifiers = mm_has_notifiers(mm);
+	/*
+	 * Skipping page tables by the non-leaf PMD accessed bit needs the TLB
+	 * flush to drop cached PMD entries, and misses secondary MMU accesses.
+	 */
+	yw.skip_pmd = !write && yw.flush && !yw.notifiers &&
+		      arch_has_hw_nonleaf_pmd_young();
+	yw.pmd_cleared = -1UL;
+	yw.read_start = start;
+	yw.read_end = mm->task_size;
+	if (start < mm->task_size &&
+	    count <= ((mm->task_size - start) >> PAGE_SHIFT) / BITS_PER_BYTE)
+		yw.read_end = start + ((count * BITS_PER_BYTE) << PAGE_SHIFT);
 
 	while (count && start < mm->task_size) {
 		len = min_t(size_t, count, YOUNG_BITMAP_CHUNK);
@@ -2148,7 +2230,8 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 			if (copy_from_user(yw.bitmap, ubuf, len))
 				break;
 		} else {
-			memset(yw.bitmap, 0, len);
+			/* young_bitmap_store() writes whole 64-bit words */
+			memset(yw.bitmap, 0, round_up(len, sizeof(u64)));
 		}
 
 		yw.start = start;
@@ -2252,7 +2335,10 @@ static ssize_t young_bitmap_flush_read(struct file *file, char __user *buf,
 	int len;
 
 	len = scnprintf(buffer, sizeof(buffer), "%d\n",
-			mm_flags_test(MMF_YOUNG_BITMAP_FLUSH, mm));
+			(mm_flags_test(MMF_YOUNG_BITMAP_FLUSH, mm) ?
+			 YOUNG_BITMAP_FLUSH : 0) |
+			(mm_flags_test(MMF_YOUNG_BITMAP_MARK, mm) ?
+			 YOUNG_BITMAP_MARK : 0));
 	return simple_read_from_buffer(buf, count, ppos, buffer, len);
 }
 
@@ -2267,13 +2353,17 @@ static ssize_t young_bitmap_flush_write(struct file *file,
 	ret = kstrtouint_from_user(buf, count, 10, &val);
 	if (ret)
 		return ret;
-	if (val > 1)
+	if (val & ~(YOUNG_BITMAP_FLUSH | YOUNG_BITMAP_MARK))
 		return -EINVAL;
 
-	if (val)
+	if (val & YOUNG_BITMAP_FLUSH)
 		mm_flags_set(MMF_YOUNG_BITMAP_FLUSH, mm);
 	else
 		mm_flags_clear(MMF_YOUNG_BITMAP_FLUSH, mm);
+	if (val & YOUNG_BITMAP_MARK)
+		mm_flags_set(MMF_YOUNG_BITMAP_MARK, mm);
+	else
+		mm_flags_clear(MMF_YOUNG_BITMAP_MARK, mm);
 	return count;
 }
 
