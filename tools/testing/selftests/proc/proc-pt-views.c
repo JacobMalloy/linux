@@ -40,6 +40,7 @@
 #include <sys/prctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -1246,6 +1247,178 @@ static int t_memfd(void)
 	return PASS;
 }
 
+/*
+ * Writes through a view to a file on a disk filesystem must survive
+ * writeback: writeback write-protects the page (page_mkclean()), so the
+ * view's next write has to fault and dirty the page again.  The directory
+ * is $PTV_FS_DIR, default /mnt; skipped on tmpfs, which has no writeback.
+ */
+struct wb_arg {
+	char *base;
+	size_t npages;
+	volatile int stop;
+	uint64_t *last;		/* last value written to each page */
+	unsigned long writes;
+};
+
+static void do_wb_writer(void *p)
+{
+	struct wb_arg *a = p;
+	uint64_t v = 1;
+
+	while (!a->stop) {
+		for (size_t i = 0; i < a->npages; i++) {
+			*word(a->base, i) = (v << 16) | i;
+			a->last[i] = (v << 16) | i;
+		}
+		v++;
+		a->writes++;
+	}
+}
+
+/* Count pages that do not hold a->last[], in a->writes */
+static void do_wb_compare(void *p)
+{
+	struct wb_arg *a = p;
+
+	a->writes = 0;
+	for (size_t i = 0; i < a->npages; i++)
+		a->writes += *word(a->base, i) != a->last[i];
+}
+
+static int file_bad(int fd, size_t npages, const uint64_t *want)
+{
+	int bad = 0;
+
+	for (size_t i = 0; i < npages; i++) {
+		uint64_t v = 0;
+
+		if (pread(fd, &v, sizeof(v), i * PS) != sizeof(v))
+			die("pread");
+		if (v != want[i] && bad++ < 3)
+			note("page %zu on disk: %#lx, expected %#lx", i,
+			     (unsigned long)v, (unsigned long)want[i]);
+	}
+	return bad;
+}
+
+/* Write back and evict @fd's pages so that reads come from the disk */
+static void wb_evict(int fd)
+{
+	if (fsync(fd))
+		die("fsync");
+	if (!try_write_str("/proc/sys/vm/drop_caches", "1"))
+		posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+}
+
+static int t_writeback(void)
+{
+	const char *dir = getenv("PTV_FS_DIR") ?: "/mnt";
+	size_t n = 64;
+	char path[256];
+	uint64_t want[64];
+	struct statfs sf;
+	struct wb_arg a = { .npages = n, .last = want };
+	pthread_t t;
+	int fd, id = view_create(), round;
+	long zapped;
+	char *buf;
+
+	if (statfs(dir, &sf) || sf.f_type == 0x01021994 /* tmpfs */ ||
+	    sf.f_type == 0x858458f6 /* ramfs */) {
+		note("no disk filesystem at %s", dir);
+		return SKIP;
+	}
+	snprintf(path, sizeof(path), "%s/pt-views-wb.%d", dir, getpid());
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0 || ftruncate(fd, n * PS))
+		die("open file");
+	unlink(path);
+	buf = mmap(NULL, n * PS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (buf == MAP_FAILED)
+		die("mmap file");
+
+	/* Write, write back, write again from the view: each round reaches disk */
+	zapped = view_stat(id, "zapped");
+	for (round = 0; round < 20; round++) {
+		struct range r = R(buf, n, (uint64_t)(round + 1) << 32);
+
+		in_view(id, do_fill, &r);
+		CHECK(r.nsig == 0, "round %d: view write faulted", round);
+		if (msync(buf, n * PS, MS_SYNC))
+			die("msync");
+		for (size_t i = 0; i < n; i++)
+			want[i] = r.tag + i;
+		CHECK(file_bad(fd, n, want) == 0, "round %d after msync", round);
+	}
+	/* page_mkclean() write-protected the pages, clearing the view's entries */
+	CHECK(no_views || view_stat(id, "zapped") - zapped >= 19 * (long)n,
+	      "writeback zapped %ld view entries",
+	      view_stat(id, "zapped") - zapped);
+
+	/* Same, with the pages evicted and faulted back between rounds */
+	for (round = 0; round < 5; round++) {
+		struct range r = R(buf, n, (uint64_t)(round + 0x40) << 32);
+
+		in_view(id, do_fill, &r);
+		munmap(buf, n * PS);
+		wb_evict(fd);
+		for (size_t i = 0; i < n; i++)
+			want[i] = r.tag + i;
+		CHECK(file_bad(fd, n, want) == 0, "evict round %d", round);
+		buf = mmap(buf, n * PS, PROT_READ | PROT_WRITE,
+			   MAP_SHARED | MAP_FIXED, fd, 0);
+		if (buf == MAP_FAILED)
+			die("mmap file again");
+		CHECK(verify_in(id, buf, n, r.tag) == 0, "view reads back round %d",
+		      round);
+	}
+
+	/* A view thread writes nonstop while view 0 writes the file back */
+	a.base = buf;
+	if (pthread_create(&t, NULL, vthread,
+			   &(struct vjob){ id, do_wb_writer, &a }))
+		die("pthread_create");
+	for (round = 0; round < 200; round++) {
+		if (round & 1)
+			sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WAIT_BEFORE |
+					SYNC_FILE_RANGE_WRITE |
+					SYNC_FILE_RANGE_WAIT_AFTER);
+		else if (msync(buf, n * PS, MS_SYNC))
+			die("msync");
+	}
+	a.stop = 1;
+	pthread_join(t, NULL);
+	/* The writer's last values were written after the last sync */
+	munmap(buf, n * PS);
+	wb_evict(fd);
+	CHECK(file_bad(fd, n, want) == 0, "concurrent writeback, %lu passes",
+	      a.writes);
+	if (verbose)
+		note("%lu writer passes over %zu pages", a.writes, n);
+
+	/* A private file mapping: view writes copy, the file is unchanged */
+	buf = mmap(NULL, n * PS, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (buf == MAP_FAILED)
+		die("mmap private");
+	a.base = buf;
+	in_view(id, do_wb_compare, &a);
+	CHECK(a.writes == 0, "view reads %lu wrong pages of the private mapping",
+	      a.writes);
+	{
+		struct range r = R(buf, n, 0x7e0000);
+
+		in_view(id, do_fill, &r);
+		CHECK(verify_in(0, buf, n, 0x7e0000) == 0, "copies seen by view 0");
+	}
+	if (msync(buf, n * PS, MS_SYNC))
+		die("msync");
+	CHECK(file_bad(fd, n, want) == 0, "private writes reached the file");
+	CHECK_VIEW(id);
+	close(fd);
+	return PASS;
+}
+
 /* Futex operations fault with page faults disabled */
 struct futex_arg {
 	char *base;
@@ -1924,6 +2097,7 @@ static const struct {
 	{ "ksm", t_ksm },
 	{ "uffd", t_uffd },
 	{ "memfd", t_memfd },
+	{ "writeback", t_writeback },
 	{ "futex", t_futex },
 	{ "syscalls", t_syscalls },
 	{ "exec", t_exec },
@@ -1951,6 +2125,21 @@ int main(int argc, char **argv)
 	    prctl(PR_PT_VIEW, PR_PT_VIEW_GET, 0, 0, 0) < 0) {
 		printf("PT_VIEWS: not supported (%s), skipping\n", strerror(errno));
 		return SKIP;
+	}
+	/* Views can be built in but unusable, e.g. with page table isolation */
+	if (!(argc > 1 && !strcmp(argv[1], "--no-views"))) {
+		pid_t pid = fork();
+		int status;
+
+		if (!pid)
+			_exit(prctl(PR_PT_VIEW, PR_PT_VIEW_CREATE, 0, 0, 0) < 0 ?
+			      errno : 0);
+		waitpid(pid, &status, 0);
+		if (WIFEXITED(status) && WEXITSTATUS(status) == EOPNOTSUPP) {
+			printf("PT_VIEWS: views unavailable (%s; pti=off?), skipping\n",
+			       strerror(EOPNOTSUPP));
+			return SKIP;
+		}
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
