@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -476,6 +477,77 @@ static int t_api(void)
 		CHECK(view_create() == n, "view %d", n);
 	CHECK(prctl(PR_PT_VIEW, PR_PT_VIEW_CREATE, 0, 0, 0) == -1 &&
 	      errno == ENOSPC, "more than %d views", MM_PT_VIEWS_MAX - 1);
+	return PASS;
+}
+
+/* Moving another thread through /proc/<pid>/pt_views/<n>/tasks */
+static volatile int spin_stop;
+static volatile int spin_view;
+static volatile pid_t spin_tid;
+
+static void *spinner(void *p)
+{
+	spin_tid = gettid();
+	while (!spin_stop) {
+		/* No system calls: the move must happen on interrupt return */
+		for (volatile int i = 0; i < 100000; i++)
+			;
+		spin_view = view_get();
+	}
+	return NULL;
+}
+
+/* Views created from outside, through /proc/<pid>/pt_views/create */
+static int t_create(void)
+{
+	char path[64], names[256] = "";
+	struct dirent *de;
+	DIR *dir;
+	pid_t pid;
+	int status;
+
+	CHECK(read_long("/proc/self/pt_views/create") == 0, "no views yet");
+	write_str("/proc/self/pt_views/create", "1");
+	CHECK(read_long("/proc/self/pt_views/create") == 1, "one view");
+	pid = fork();
+	if (!pid) {
+		snprintf(path, sizeof(path), "/proc/%d/pt_views/create",
+			 getppid());
+		_exit(try_write_str(path, "1") ? 0 : 1);
+	}
+	waitpid(pid, &status, 0);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "creating a view from another process");
+	CHECK(read_long("/proc/self/pt_views/create") == 2, "two views");
+	dir = opendir("/proc/self/pt_views");
+	while (dir && (de = readdir(dir))) {
+		strcat(names, " ");
+		strcat(names, de->d_name);
+	}
+	if (dir)
+		closedir(dir);
+	CHECK(!strcmp(names, " . .. create 0 1 2"), "listing:%s", names);
+
+	/* Move a thread onto the new view from outside */
+	{
+		int id = 2;
+
+		spin_view = -1;
+		spin_stop = 0;
+		pthread_t t;
+		char buf[16];
+
+		pthread_create(&t, NULL, spinner, NULL);
+		while (spin_view < 0)
+			usleep(1000);
+		snprintf(buf, sizeof(buf), "%d", spin_tid);
+		write_str(view_path(path, id, "tasks"), buf);
+		for (int tries = 0; tries < 500 && spin_view != id; tries++)
+			usleep(10000);
+		CHECK(spin_view == id, "spinner on view %d", spin_view);
+		spin_stop = 1;
+		pthread_join(t, NULL);
+	}
 	return PASS;
 }
 
@@ -1379,22 +1451,6 @@ static int t_exec(void)
 	return PASS;
 }
 
-/* Moving another thread through /proc/<pid>/pt_views/<n>/tasks */
-static volatile int spin_stop;
-static volatile int spin_view;
-static volatile pid_t spin_tid;
-
-static void *spinner(void *p)
-{
-	spin_tid = gettid();
-	while (!spin_stop) {
-		/* No system calls: the move must happen on interrupt return */
-		for (volatile int i = 0; i < 100000; i++)
-			;
-		spin_view = view_get();
-	}
-	return NULL;
-}
 
 static int t_move(void)
 {
@@ -1838,6 +1894,7 @@ static const struct {
 	int (*fn)(void);
 } tests[] = {
 	{ "api", t_api },
+	{ "create", t_create },
 	{ "attribution", t_attribution },
 	{ "first_touch", t_first_touch },
 	{ "soft_dirty", t_soft_dirty },

@@ -42,5 +42,6 @@ the Linux memory management.
    transhuge
    userfaultfd
    young_bitmap
+   pt_views
    zswap
    kho

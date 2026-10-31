@@ -417,6 +417,7 @@ extern const struct file_operations proc_pt_view_young_bitmap_operations;
 extern const struct file_operations proc_pt_view_tasks_operations;
 extern const struct file_operations proc_pt_view_stats_operations;
 extern const struct file_operations proc_pt_view_check_operations;
+extern const struct file_operations proc_pt_views_create_operations;
 #endif
 
 extern unsigned long task_vsize(struct mm_struct *);

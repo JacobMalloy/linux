@@ -2791,6 +2791,9 @@ static struct dentry *proc_pt_views_instantiate(struct dentry *dentry,
 	return d_splice_alias_ops(inode, dentry, &pid_dentry_operations);
 }
 
+static const struct pid_entry pt_views_create_entry =
+	REG("create", S_IRUSR|S_IWUSR, proc_pt_views_create_operations);
+
 /* Bit n set for each existing view n of @task's mm */
 static unsigned long pt_views_mask(struct task_struct *task)
 {
@@ -2818,6 +2821,12 @@ static struct dentry *proc_pt_views_lookup(struct inode *dir,
 
 	if (!task)
 		return res;
+	if (!strcmp(dentry->d_name.name, pt_views_create_entry.name)) {
+		res = proc_pident_instantiate(dentry, task,
+					      &pt_views_create_entry);
+		put_task_struct(task);
+		return res;
+	}
 	for (id = 0; id < MM_PT_VIEWS_MAX; id++) {
 		snprintf(name, sizeof(name), "%u", id);
 		if (!strcmp(dentry->d_name.name, name))
@@ -2842,9 +2851,17 @@ static int proc_pt_views_readdir(struct file *file, struct dir_context *ctx)
 		return -ENOENT;
 	if (!dir_emit_dots(file, ctx))
 		goto out;
+	/* Position 2 is "create", n + 3 is view n */
+	if (ctx->pos == 2) {
+		if (!proc_fill_cache(file, ctx, pt_views_create_entry.name,
+				     pt_views_create_entry.len,
+				     proc_pident_instantiate, task,
+				     &pt_views_create_entry))
+			goto out;
+		ctx->pos++;
+	}
 	mask = pt_views_mask(task);
-	/* Position n + 2 is view n */
-	for (id = ctx->pos - 2; id < MM_PT_VIEWS_MAX; id++, ctx->pos++) {
+	for (id = ctx->pos - 3; id < MM_PT_VIEWS_MAX; id++, ctx->pos++) {
 		if (!(mask & BIT(id)))
 			continue;
 		len = snprintf(name, sizeof(name), "%u", id);
