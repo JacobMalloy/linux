@@ -2791,9 +2791,6 @@ static struct dentry *proc_pt_views_instantiate(struct dentry *dentry,
 	return d_splice_alias_ops(inode, dentry, &pid_dentry_operations);
 }
 
-static const struct pid_entry pt_views_create_entry =
-	REG("create", S_IRUSR|S_IWUSR, proc_pt_views_create_operations);
-
 /* Bit n set for each existing view n of @task's mm */
 static unsigned long pt_views_mask(struct task_struct *task)
 {
@@ -2810,31 +2807,69 @@ static unsigned long pt_views_mask(struct task_struct *task)
 	return mask;
 }
 
+/* The view id a /proc/<pid>/pt_views/ entry is named for, or -1 */
+static int pt_views_name_to_id(struct dentry *dentry)
+{
+	char name[4];
+	int id;
+
+	for (id = 0; id < MM_PT_VIEWS_MAX; id++) {
+		snprintf(name, sizeof(name), "%d", id);
+		if (!strcmp(dentry->d_name.name, name))
+			return id;
+	}
+	return -1;
+}
+
 static struct dentry *proc_pt_views_lookup(struct inode *dir,
 					   struct dentry *dentry,
 					   unsigned int flags)
 {
 	struct task_struct *task = get_proc_task(dir);
 	struct dentry *res = ERR_PTR(-ENOENT);
-	char name[4];
-	unsigned int id;
+	int id;
 
 	if (!task)
 		return res;
-	if (!strcmp(dentry->d_name.name, pt_views_create_entry.name)) {
-		res = proc_pident_instantiate(dentry, task,
-					      &pt_views_create_entry);
-		put_task_struct(task);
-		return res;
-	}
-	for (id = 0; id < MM_PT_VIEWS_MAX; id++) {
-		snprintf(name, sizeof(name), "%u", id);
-		if (!strcmp(dentry->d_name.name, name))
-			break;
-	}
-	if (id < MM_PT_VIEWS_MAX && (pt_views_mask(task) & BIT(id)))
+	id = pt_views_name_to_id(dentry);
+	if (id >= 0 && (pt_views_mask(task) & BIT(id)))
 		res = proc_pt_views_instantiate(dentry, task,
 						(void *)(unsigned long)id);
+	else if (flags & LOOKUP_CREATE)
+		res = NULL;	/* negative, for mkdir() to fill in */
+	put_task_struct(task);
+	return res;
+}
+
+/*
+ * mkdir /proc/<pid>/pt_views/<n> creates view n, so that a tool can set up
+ * views for an unmodified program.
+ */
+static struct dentry *proc_pt_views_mkdir(struct mnt_idmap *idmap,
+					  struct inode *dir,
+					  struct dentry *dentry, umode_t mode)
+{
+	struct task_struct *task = get_proc_task(dir);
+	struct dentry *res;
+	struct mm_struct *mm;
+	int id = pt_views_name_to_id(dentry);
+
+	if (!task)
+		return ERR_PTR(-ENOENT);
+	res = ERR_PTR(id ? -EINVAL : -EEXIST);
+	if (id <= 0)
+		goto out;
+	mm = mm_access(task, PTRACE_MODE_ATTACH_FSCREDS);
+	if (IS_ERR_OR_NULL(mm)) {
+		res = mm ? ERR_CAST(mm) : ERR_PTR(-ESRCH);
+		goto out;
+	}
+	id = mm_pt_view_create(mm, id);
+	mmput(mm);
+	res = id < 0 ? ERR_PTR(id) :
+		proc_pt_views_instantiate(dentry, task,
+					  (void *)(unsigned long)id);
+out:
 	put_task_struct(task);
 	return res;
 }
@@ -2851,17 +2886,9 @@ static int proc_pt_views_readdir(struct file *file, struct dir_context *ctx)
 		return -ENOENT;
 	if (!dir_emit_dots(file, ctx))
 		goto out;
-	/* Position 2 is "create", n + 3 is view n */
-	if (ctx->pos == 2) {
-		if (!proc_fill_cache(file, ctx, pt_views_create_entry.name,
-				     pt_views_create_entry.len,
-				     proc_pident_instantiate, task,
-				     &pt_views_create_entry))
-			goto out;
-		ctx->pos++;
-	}
+	/* Position n + 2 is view n */
 	mask = pt_views_mask(task);
-	for (id = ctx->pos - 3; id < MM_PT_VIEWS_MAX; id++, ctx->pos++) {
+	for (id = ctx->pos - 2; id < MM_PT_VIEWS_MAX; id++, ctx->pos++) {
 		if (!(mask & BIT(id)))
 			continue;
 		len = snprintf(name, sizeof(name), "%u", id);
@@ -2883,6 +2910,7 @@ static const struct file_operations proc_pt_views_operations = {
 
 static const struct inode_operations proc_pt_views_inode_operations = {
 	.lookup		= proc_pt_views_lookup,
+	.mkdir		= proc_pt_views_mkdir,
 	.getattr	= pid_getattr,
 	.setattr	= proc_nochmod_setattr,
 };
@@ -3480,7 +3508,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("young_bitmap", S_IRUSR|S_IWUSR, proc_young_bitmap_operations),
 	REG("young_bitmap_flush", S_IRUSR|S_IWUSR, proc_young_bitmap_flush_operations),
 #ifdef CONFIG_MM_PT_VIEWS
-	DIR("pt_views",	  S_IRUSR|S_IXUSR, proc_pt_views_inode_operations, proc_pt_views_operations),
+	DIR("pt_views",	  S_IRWXU, proc_pt_views_inode_operations, proc_pt_views_operations),
 #endif
 #endif
 #ifdef CONFIG_SECURITY

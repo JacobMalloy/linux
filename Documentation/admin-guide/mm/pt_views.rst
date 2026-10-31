@@ -61,7 +61,7 @@ prctl()
 -------
 
 ``prctl(PR_PT_VIEW, PR_PT_VIEW_CREATE, 0, 0, 0)``
-  Creates a view and returns its id.
+  Creates the lowest-numbered free view and returns its id.
 
 ``prctl(PR_PT_VIEW, PR_PT_VIEW_SET, id, 0, 0)``
   Moves the calling thread onto view ``id`` (0 for the process's own page
@@ -75,9 +75,11 @@ New threads start on the view of the thread that created them.
 /proc/pid/pt_views/
 -------------------
 
-``create``
-  Writing anything creates a view; reading returns the id of the newest
-  view. This lets a tool set up views for an unmodified program.
+``mkdir /proc/pid/pt_views/<n>``
+  Creates view ``n`` (1 to 7), so that a tool can set up views for an
+  unmodified program. Fails with ``EEXIST`` if the view exists and
+  ``EINVAL`` if ``n`` is not a view id. Views cannot be removed; they last
+  as long as the process's address space.
 
 ``<n>/young_bitmap``
   Like ``/proc/pid/young_bitmap``, but for the accessed bits of view ``n``
@@ -101,7 +103,7 @@ New threads start on the view of the thread that created them.
   match view 0, which must be 0 whenever none of the process's page tables
   is being changed. For testing.
 
-Opening ``young_bitmap``, writing to ``tasks`` or ``create`` requires
+Creating a view, opening ``young_bitmap`` or writing to ``tasks`` requires
 permission to ptrace-attach to the process; reading the other files
 requires read permission.
 
@@ -111,7 +113,7 @@ Example
 To find the heap pages that a JVM's garbage collector threads touched,
 without changing the JVM::
 
-	echo 1 > /proc/$pid/pt_views/create
+	mkdir /proc/$pid/pt_views/1
 	for t in /proc/$pid/task/*; do
 		case $(cat $t/comm) in
 		"GC Thread"*|"G1 "*|Z*) echo ${t##*/} > /proc/$pid/pt_views/1/tasks;;

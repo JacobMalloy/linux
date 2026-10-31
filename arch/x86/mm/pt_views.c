@@ -44,12 +44,15 @@ struct mm_pt_view *mm_pt_view_get(struct mm_struct *mm, int id)
 	return smp_load_acquire(&views->view[id]);
 }
 
-int mm_pt_view_create(struct mm_struct *mm)
+/* Create view @id, or the lowest free one if @id is 0; returns its id */
+int mm_pt_view_create(struct mm_struct *mm, int id)
 {
 	struct mm_pt_views *views, *new;
 	struct mm_pt_view *view;
-	int id, ret;
+	int ret;
 
+	if (id < 0 || id >= MM_PT_VIEWS_MAX)
+		return -EINVAL;
 	/*
 	 * PTI would need a user copy of every view PGD, and broadcast TLB
 	 * flushing keeps ASIDs valid across CR3 loads, which views rely on to
@@ -73,12 +76,18 @@ int mm_pt_view_create(struct mm_struct *mm)
 	}
 
 	mutex_lock(&views->lock);
-	for (id = 1; id < MM_PT_VIEWS_MAX; id++)
-		if (!views->view[id])
-			break;
-	ret = -ENOSPC;
-	if (id == MM_PT_VIEWS_MAX)
-		goto unlock;
+	if (id) {
+		ret = -EEXIST;
+		if (views->view[id])
+			goto unlock;
+	} else {
+		for (id = 1; id < MM_PT_VIEWS_MAX; id++)
+			if (!views->view[id])
+				break;
+		ret = -ENOSPC;
+		if (id == MM_PT_VIEWS_MAX)
+			goto unlock;
+	}
 
 	ret = -ENOMEM;
 	view = kzalloc(sizeof(*view), GFP_KERNEL_ACCOUNT);

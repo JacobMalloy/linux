@@ -497,7 +497,7 @@ static void *spinner(void *p)
 	return NULL;
 }
 
-/* Views created from outside, through /proc/<pid>/pt_views/create */
+/* Views created from outside, with mkdir /proc/<pid>/pt_views/<n> */
 static int t_create(void)
 {
 	char path[64], names[256] = "";
@@ -506,19 +506,32 @@ static int t_create(void)
 	pid_t pid;
 	int status;
 
-	CHECK(read_long("/proc/self/pt_views/create") == 0, "no views yet");
-	write_str("/proc/self/pt_views/create", "1");
-	CHECK(read_long("/proc/self/pt_views/create") == 1, "one view");
+	CHECK(access("/proc/self/pt_views/1", F_OK) && errno == ENOENT,
+	      "no views yet");
+	CHECK(!mkdir("/proc/self/pt_views/1", 0700), "mkdir 1: %m");
+	CHECK(view_create() == 2, "prctl takes the next free id");
+	CHECK(mkdir("/proc/self/pt_views/1", 0700) && errno == EEXIST,
+	      "mkdir of an existing view");
+	CHECK(mkdir("/proc/self/pt_views/0", 0700) && errno == EEXIST,
+	      "mkdir 0");
+	CHECK(mkdir("/proc/self/pt_views/8", 0700) && errno == EINVAL,
+	      "mkdir past the last view");
+	CHECK(mkdir("/proc/self/pt_views/x", 0700) && errno == EINVAL,
+	      "mkdir of a name that is not a view id");
+	CHECK(mkdir("/proc/self/pt_views/01", 0700) && errno == EINVAL,
+	      "mkdir 01");
+	CHECK(rmdir("/proc/self/pt_views/1") && errno == EPERM,
+	      "rmdir: views are not destroyed");
 	pid = fork();
 	if (!pid) {
-		snprintf(path, sizeof(path), "/proc/%d/pt_views/create",
-			 getppid());
-		_exit(try_write_str(path, "1") ? 0 : 1);
+		/* Create view 5 in the parent, leaving a gap */
+		snprintf(path, sizeof(path), "/proc/%d/pt_views/5", getppid());
+		_exit(mkdir(path, 0700) ? 1 : 0);
 	}
 	waitpid(pid, &status, 0);
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
 	      "creating a view from another process");
-	CHECK(read_long("/proc/self/pt_views/create") == 2, "two views");
+	CHECK(view_create() == 3, "prctl fills the gap");
 	dir = opendir("/proc/self/pt_views");
 	while (dir && (de = readdir(dir))) {
 		strcat(names, " ");
@@ -526,11 +539,11 @@ static int t_create(void)
 	}
 	if (dir)
 		closedir(dir);
-	CHECK(!strcmp(names, " . .. create 0 1 2"), "listing:%s", names);
+	CHECK(!strcmp(names, " . .. 0 1 2 3 5"), "listing:%s", names);
 
 	/* Move a thread onto the new view from outside */
 	{
-		int id = 2;
+		int id = 5;
 
 		spin_view = -1;
 		spin_stop = 0;

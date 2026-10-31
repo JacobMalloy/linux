@@ -2577,53 +2577,6 @@ const struct file_operations proc_pt_view_stats_operations = {
 	.release	= pt_view_tasks_release,
 };
 
-/*
- * /proc/<pid>/pt_views/create: writing anything creates a view, so that a
- * tool can set up views for an unmodified program.  Reading returns the
- * id of the last view.
- */
-static ssize_t pt_views_create_write(struct file *file, const char __user *buf,
-				     size_t count, loff_t *ppos)
-{
-	struct mm_struct *mm = file->private_data;
-	int id;
-
-	if (!mmget_not_zero(mm))
-		return -ESRCH;
-	id = mm_pt_view_create(mm);
-	mmput(mm);
-	return id < 0 ? id : count;
-}
-
-static ssize_t pt_views_create_read(struct file *file, char __user *buf,
-				    size_t count, loff_t *ppos)
-{
-	struct mm_struct *mm = file->private_data;
-	char buffer[8];
-	int id, last = 0, len;
-
-	for (id = 1; id < MM_PT_VIEWS_MAX; id++)
-		if (mm_pt_view_get(mm, id))
-			last = id;
-	len = scnprintf(buffer, sizeof(buffer), "%d\n", last);
-	return simple_read_from_buffer(buf, count, ppos, buffer, len);
-}
-
-static int pt_views_create_open(struct inode *inode, struct file *file)
-{
-	return __young_bitmap_open(inode, file,
-				   (file->f_mode & FMODE_WRITE) ?
-				   PTRACE_MODE_ATTACH : PTRACE_MODE_READ);
-}
-
-const struct file_operations proc_pt_views_create_operations = {
-	.llseek		= noop_llseek,
-	.read		= pt_views_create_read,
-	.write		= pt_views_create_write,
-	.open		= pt_views_create_open,
-	.release	= young_bitmap_release,
-};
-
 const struct file_operations proc_pt_view_check_operations = {
 	.open		= pt_view_check_open,
 	.read		= seq_read,

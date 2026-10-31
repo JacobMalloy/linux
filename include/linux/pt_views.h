@@ -77,7 +77,7 @@ static inline pgd_t *pt_view_pgd(struct mm_struct *mm, struct task_struct *tsk)
 }
 
 struct mm_pt_view *mm_pt_view_get(struct mm_struct *mm, int id);
-int mm_pt_view_create(struct mm_struct *mm);
+int mm_pt_view_create(struct mm_struct *mm, int id);
 int pt_view_set_current(int id);
 int pt_view_move_task(struct task_struct *tsk, struct mm_struct *mm, int id);
 void mm_pt_views_free(struct mm_struct *mm);

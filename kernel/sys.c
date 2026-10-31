@@ -2916,7 +2916,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		case PR_PT_VIEW_CREATE:
 			if (arg3)
 				return -EINVAL;
-			error = me->mm ? mm_pt_view_create(me->mm) : -EINVAL;
+			error = me->mm ? mm_pt_view_create(me->mm, 0) : -EINVAL;
 			break;
 		case PR_PT_VIEW_SET:
 			if (arg3 >= MM_PT_VIEWS_MAX)
