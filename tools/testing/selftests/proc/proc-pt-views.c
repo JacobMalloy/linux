@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -1649,6 +1650,189 @@ static int t_many_views(void)
 	return PASS;
 }
 
+/* Processes ending while threads on views are busy */
+static void *busy_toucher(void *p)
+{
+	char *buf = p;
+
+	if ((uintptr_t)buf & 1) {
+		buf--;
+	} else {
+		view_set(1);
+	}
+	for (unsigned long i = 0;; i++) {
+		buf[(i * 4099 * 64) % (256 * PS)]++;
+		if (!(i & 0xffff))
+			madvise(buf + (i % 256) * PS, 16 * PS, MADV_DONTNEED);
+	}
+	return NULL;
+}
+
+static pid_t busy_child(int how)
+{
+	pid_t pid = fork();
+
+	if (!pid) {
+		char *buf = map_anon(256 * PS, PROT_READ | PROT_WRITE);
+		pthread_t t;
+
+		view_create();
+		for (int i = 0; i < 3; i++)
+			pthread_create(&t, NULL, busy_toucher, buf);
+		pthread_create(&t, NULL, busy_toucher, buf + 1);  /* view 0 */
+		usleep(200000);
+		if (how == 1)
+			exit(0);
+		if (how == 2)
+			execl("/proc/self/exe", "proc-pt-views", "--print-view",
+			      NULL);
+		pause();
+		_exit(3);
+	}
+	return pid;
+}
+
+static int t_exit(void)
+{
+	int status;
+	pid_t pid;
+
+	for (int round = 0; round < 3; round++) {
+		pid = busy_child(1);
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		      "exit: status %#x", status);
+		pid = busy_child(0);
+		usleep(250000);
+		kill(pid, SIGKILL);
+		waitpid(pid, &status, 0);
+		CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+		      "kill: status %#x", status);
+		pid = busy_child(2);
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		      "exec with threads on views: status %#x", status);
+	}
+	return PASS;
+}
+
+/* Protection keys apply to view threads without any page table change */
+static int pkey_sig;
+
+static void do_pkey_write(void *p)
+{
+	struct range *r = p;
+	int pkey = r->step;
+
+	r->step = 1;
+	pkey_set(pkey, PKEY_DISABLE_WRITE);
+	do_fill(r);
+	pkey_sig = r->sig;
+	r->nsig = 0;
+	pkey_set(pkey, 0);
+	r->tag += 0x100;
+	do_fill(r);
+}
+
+static int t_pkeys(void)
+{
+	size_t n = 16;
+	char *buf = map_anon(n * PS, PROT_READ | PROT_WRITE);
+	int id = view_create(), pkey = pkey_alloc(0, 0);
+	struct range r = R(buf, n, 0x21000);
+
+	if (pkey < 0)
+		return SKIP;
+	in_view(id, do_fill, &r);		/* writable view entries */
+	if (pkey_mprotect(buf, n * PS, PROT_READ | PROT_WRITE, pkey))
+		die("pkey_mprotect");
+	r.tag = 0x22000;
+	r.step = pkey;
+	r.nsig = 0;
+	in_view(id, do_pkey_write, &r);
+	CHECK(pkey_sig == SIGSEGV, "write with the key disabled: signal %d",
+	      pkey_sig);
+	CHECK(r.nsig == 0, "%d writes faulted with the key enabled", r.nsig);
+	CHECK(verify_in(0, buf, n, 0x22100) == 0, "data");
+	CHECK_VIEW(id);
+	return PASS;
+}
+
+/* A memory cgroup limit forces reclaim of a view thread's memory */
+static bool cgroup_enter(const char *name, const char *max, const char *swap)
+{
+	char path[128], pid[16];
+
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s", name);
+	if (mkdir(path, 0755) && errno != EEXIST)
+		return false;
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/memory.max", name);
+	if (!try_write_str(path, max))
+		return false;
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/memory.swap.max", name);
+	try_write_str(path, swap);
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cgroup.procs", name);
+	snprintf(pid, sizeof(pid), "%d", getpid());
+	return try_write_str(path, pid);
+}
+
+static int t_memcg(void)
+{
+	size_t n = 48 << 20 >> 12;		/* 48 MiB in a 16 MiB cgroup */
+	char *buf;
+	struct range r;
+	int id;
+
+	if (!have_swap() || !cgroup_enter("pt-views-memcg", "16M", "max"))
+		return SKIP;
+	buf = map_anon(n * PS, PROT_READ | PROT_WRITE);
+	madvise(buf, n * PS, MADV_NOHUGEPAGE);
+	id = view_create();
+	r = R(buf, n, 0x23000);
+	in_view(id, do_fill, &r);
+	CHECK(verify_in(id, buf, n, 0x23000) == 0, "view after reclaim");
+	CHECK(verify_in(0, buf, n, 0x23000) == 0, "view 0 after reclaim");
+	r.tag = 0x24000;
+	in_view(id, do_fill, &r);
+	CHECK(verify_in(0, buf, n, 0x24000) == 0, "view 0 after view rewrite");
+	note("view %d: %ld fills, %ld zapped", id, view_stat(id, "fills"),
+	     view_stat(id, "zapped"));
+	CHECK_VIEW(id);
+	return PASS;
+}
+
+static void do_hog(void *p)
+{
+	for (;;) {
+		char *b = mmap(NULL, 16 << 20, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (b == MAP_FAILED)
+			return;
+		memset(b, 1, 16 << 20);
+	}
+}
+
+static int t_oom(void)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (!pid) {
+		if (!cgroup_enter("pt-views-oom", "32M", "0"))
+			_exit(SKIP);
+		view_create();
+		in_view(1, do_hog, NULL);
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == SKIP)
+		return SKIP;
+	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+	      "hog not OOM-killed: status %#x", status);
+	return PASS;
+}
+
 static const struct {
 	const char *name;
 	int (*fn)(void);
@@ -1676,6 +1860,10 @@ static const struct {
 	{ "move", t_move },
 	{ "young_markers", t_young_markers },
 	{ "many_views", t_many_views },
+	{ "exit", t_exit },
+	{ "pkeys", t_pkeys },
+	{ "memcg", t_memcg },
+	{ "oom", t_oom },
 	{ "stress", t_stress },
 };
 
