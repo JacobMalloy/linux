@@ -18,6 +18,7 @@
 #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
 #include <linux/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
 #include <linux/mm_types.h>
+#include <linux/pt_views.h>
 #include <linux/mm.h>			/* find_and_lock_vma() */
 #include <linux/vmalloc.h>
 
@@ -1275,6 +1276,15 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * in a region with pagefaults disabled then we must not take the fault
 	 */
 	if (unlikely(faulthandler_disabled() || !mm)) {
+		/*
+		 * A thread on a page table view may fault on a page that view
+		 * 0 has, e.g. in a futex operation, whose fixup only faults it
+		 * in through view 0.  Copy it in if that can be done here.
+		 */
+		if (mm && pt_view_current() &&
+		    pt_view_fault_atomic(mm, address,
+					 error_code & (X86_PF_WRITE | X86_PF_SHSTK)))
+			return;
 		bad_area_nosemaphore(regs, error_code, address);
 		return;
 	}
@@ -1329,6 +1339,10 @@ void do_user_addr_fault(struct pt_regs *regs,
 #endif
 
 	if (!(flags & FAULT_FLAG_USER))
+		goto lock_mmap;
+
+	/* Page table views are filled under the mmap lock, see below */
+	if (pt_view_current())
 		goto lock_mmap;
 
 	vma = lock_vma_under_rcu(mm, address);
@@ -1391,7 +1405,10 @@ retry:
 	 * userland). The return to userland is identified whenever
 	 * FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in flags.
 	 */
-	fault = handle_mm_fault(vma, address, flags, regs);
+	if (pt_view_current())
+		fault = pt_view_handle_fault(vma, address, flags, regs);
+	else
+		fault = handle_mm_fault(vma, address, flags, regs);
 
 	if (fault_signal_pending(fault, regs)) {
 		/*

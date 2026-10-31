@@ -73,6 +73,7 @@
 #include <linux/mount.h>
 #include <linux/security.h>
 #include <linux/ptrace.h>
+#include <linux/pt_views.h>
 #include <linux/printk.h>
 #include <linux/cache.h>
 #include <linux/cgroup.h>
@@ -2734,6 +2735,142 @@ out:
 	return 0;
 }
 
+#ifdef CONFIG_MM_PT_VIEWS
+/*
+ * /proc/<pid>/pt_views/<n>/: a directory for each page table view of the
+ * process (pt_views.h), view 0 being its own page table.  The view id is
+ * kept in the fd field of the directory's proc_inode.
+ */
+static const struct pid_entry pt_view_stuff[] = {
+	REG("young_bitmap", S_IRUSR|S_IWUSR, proc_pt_view_young_bitmap_operations),
+	REG("tasks",	    S_IRUSR|S_IWUSR, proc_pt_view_tasks_operations),
+	REG("stats",	    S_IRUSR, proc_pt_view_stats_operations),
+	REG("check",	    S_IRUSR, proc_pt_view_check_operations),
+};
+
+static int proc_pt_view_readdir(struct file *file, struct dir_context *ctx)
+{
+	return proc_pident_readdir(file, ctx, pt_view_stuff,
+				   ARRAY_SIZE(pt_view_stuff));
+}
+
+static struct dentry *proc_pt_view_lookup(struct inode *dir,
+					  struct dentry *dentry,
+					  unsigned int flags)
+{
+	return proc_pident_lookup(dir, dentry, pt_view_stuff,
+				  pt_view_stuff + ARRAY_SIZE(pt_view_stuff));
+}
+
+static const struct file_operations proc_pt_view_operations = {
+	.read		= generic_read_dir,
+	.iterate_shared	= proc_pt_view_readdir,
+	.llseek		= generic_file_llseek,
+};
+
+static const struct inode_operations proc_pt_view_inode_operations = {
+	.lookup		= proc_pt_view_lookup,
+	.getattr	= pid_getattr,
+	.setattr	= proc_nochmod_setattr,
+};
+
+static struct dentry *proc_pt_views_instantiate(struct dentry *dentry,
+		struct task_struct *task, const void *ptr)
+{
+	struct inode *inode;
+
+	inode = proc_pid_make_inode(dentry->d_sb, task,
+				    S_IFDIR | S_IRUSR | S_IXUSR);
+	if (!inode)
+		return ERR_PTR(-ENOENT);
+	PROC_I(inode)->fd = (unsigned long)ptr;
+	inode->i_op = &proc_pt_view_inode_operations;
+	inode->i_fop = &proc_pt_view_operations;
+	set_nlink(inode, 2);
+	pid_update_inode(task, inode);
+	return d_splice_alias_ops(inode, dentry, &pid_dentry_operations);
+}
+
+/* Bit n set for each existing view n of @task's mm */
+static unsigned long pt_views_mask(struct task_struct *task)
+{
+	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	unsigned long mask = 1;
+	int id;
+
+	if (IS_ERR_OR_NULL(mm))
+		return 0;
+	for (id = 1; id < MM_PT_VIEWS_MAX; id++)
+		if (mm_pt_view_get(mm, id))
+			mask |= BIT(id);
+	mmput(mm);
+	return mask;
+}
+
+static struct dentry *proc_pt_views_lookup(struct inode *dir,
+					   struct dentry *dentry,
+					   unsigned int flags)
+{
+	struct task_struct *task = get_proc_task(dir);
+	struct dentry *res = ERR_PTR(-ENOENT);
+	char name[4];
+	unsigned int id;
+
+	if (!task)
+		return res;
+	for (id = 0; id < MM_PT_VIEWS_MAX; id++) {
+		snprintf(name, sizeof(name), "%u", id);
+		if (!strcmp(dentry->d_name.name, name))
+			break;
+	}
+	if (id < MM_PT_VIEWS_MAX && (pt_views_mask(task) & BIT(id)))
+		res = proc_pt_views_instantiate(dentry, task,
+						(void *)(unsigned long)id);
+	put_task_struct(task);
+	return res;
+}
+
+static int proc_pt_views_readdir(struct file *file, struct dir_context *ctx)
+{
+	struct task_struct *task = get_proc_task(file_inode(file));
+	unsigned long mask;
+	unsigned int id;
+	char name[4];
+	int len;
+
+	if (!task)
+		return -ENOENT;
+	if (!dir_emit_dots(file, ctx))
+		goto out;
+	mask = pt_views_mask(task);
+	/* Position n + 2 is view n */
+	for (id = ctx->pos - 2; id < MM_PT_VIEWS_MAX; id++, ctx->pos++) {
+		if (!(mask & BIT(id)))
+			continue;
+		len = snprintf(name, sizeof(name), "%u", id);
+		if (!proc_fill_cache(file, ctx, name, len,
+				     proc_pt_views_instantiate, task,
+				     (void *)(unsigned long)id))
+			break;
+	}
+out:
+	put_task_struct(task);
+	return 0;
+}
+
+static const struct file_operations proc_pt_views_operations = {
+	.read		= generic_read_dir,
+	.iterate_shared	= proc_pt_views_readdir,
+	.llseek		= generic_file_llseek,
+};
+
+static const struct inode_operations proc_pt_views_inode_operations = {
+	.lookup		= proc_pt_views_lookup,
+	.getattr	= pid_getattr,
+	.setattr	= proc_nochmod_setattr,
+};
+#endif /* CONFIG_MM_PT_VIEWS */
+
 #ifdef CONFIG_SECURITY
 static int proc_pid_attr_open(struct inode *inode, struct file *file)
 {
@@ -3325,6 +3462,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("pagemap",    S_IRUSR, proc_pagemap_operations),
 	REG("young_bitmap", S_IRUSR|S_IWUSR, proc_young_bitmap_operations),
 	REG("young_bitmap_flush", S_IRUSR|S_IWUSR, proc_young_bitmap_flush_operations),
+#ifdef CONFIG_MM_PT_VIEWS
+	DIR("pt_views",	  S_IRUSR|S_IXUSR, proc_pt_views_inode_operations, proc_pt_views_operations),
+#endif
 #endif
 #ifdef CONFIG_SECURITY
 	DIR("attr",       S_IRUGO|S_IXUGO, proc_attr_dir_inode_operations, proc_attr_dir_operations),

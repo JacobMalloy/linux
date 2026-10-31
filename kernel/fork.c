@@ -42,6 +42,7 @@
 #include <linux/binfmts.h>
 #include <linux/mman.h>
 #include <linux/mmu_notifier.h>
+#include <linux/pt_views.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
@@ -731,6 +732,7 @@ void __mmdrop(struct mm_struct *mm)
 
 	WARN_ON_ONCE(mm == current->active_mm);
 	mm_destroy_sched(mm);
+	mm_pt_views_free(mm);
 	mm_free_pgd(mm);
 	mm_free_id(mm);
 	destroy_context(mm);
@@ -1110,6 +1112,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 	mm_pasid_init(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
 	mmu_notifier_subscriptions_init(mm);
+#ifdef CONFIG_MM_PT_VIEWS
+	mm->pt_views = NULL;
+#endif
 	init_tlb_flush_pending(mm);
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !defined(CONFIG_SPLIT_PMD_PTLOCKS)
 	mm->pmd_huge_pte = NULL;
@@ -1578,6 +1583,10 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 
 	tsk->mm = NULL;
 	tsk->active_mm = NULL;
+#ifdef CONFIG_MM_PT_VIEWS
+	/* Threads stay on their parent's page table view, see pt_views.h */
+	tsk->pt_view = (clone_flags & CLONE_VM) ? current->pt_view : NULL;
+#endif
 
 	/*
 	 * Are we cloning a kernel thread?

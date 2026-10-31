@@ -11,6 +11,7 @@
 #include <linux/sched/smt.h>
 #include <linux/task_work.h>
 #include <linux/mmu_notifier.h>
+#include <linux/pt_views.h>
 #include <linux/mmu_context.h>
 #include <linux/kvm_types.h>
 
@@ -216,6 +217,47 @@ static void clear_asid_other(void)
 }
 
 atomic64_t last_mm_ctx_id = ATOMIC64_INIT(1);
+
+#ifdef CONFIG_MM_PT_VIEWS
+/*
+ * With page table views (pt_views.h), threads of one mm can run on
+ * different page tables.  They share the mm's ASID, so the TLB must be
+ * flushed whenever an ASID slot is loaded with a different page table than
+ * it last held, or one view would use translations (and skip accessed bit
+ * updates) cached from another.  Track the page table of each slot and the
+ * one in CR3.
+ */
+static DEFINE_PER_CPU(pgd_t *, asid_pgd[TLB_NR_DYN_ASIDS]);
+static DEFINE_PER_CPU(pgd_t *, loaded_pgd);
+
+static inline pgd_t *this_cpu_loaded_pgd(struct mm_struct *loaded_mm)
+{
+	return this_cpu_read(loaded_pgd) ?: loaded_mm->pgd;
+}
+
+static inline void set_loaded_pgd(u16 asid, pgd_t *pgd)
+{
+	if (asid < TLB_NR_DYN_ASIDS)
+		this_cpu_write(asid_pgd[asid], pgd);
+	this_cpu_write(loaded_pgd, pgd);
+}
+
+static inline bool asid_pgd_changed(u16 asid, pgd_t *pgd)
+{
+	return asid < TLB_NR_DYN_ASIDS && this_cpu_read(asid_pgd[asid]) != pgd;
+}
+#else
+static inline pgd_t *this_cpu_loaded_pgd(struct mm_struct *loaded_mm)
+{
+	return loaded_mm->pgd;
+}
+static inline void set_loaded_pgd(u16 asid, pgd_t *pgd) { }
+static inline bool asid_pgd_changed(u16 asid, pgd_t *pgd) { return false; }
+static inline pgd_t *pt_view_pgd(struct mm_struct *mm, struct task_struct *tsk)
+{
+	return mm->pgd;
+}
+#endif
 
 struct new_asid {
 	unsigned int asid	: 16;
@@ -787,6 +829,7 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
 	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
 	unsigned cpu = smp_processor_id();
+	pgd_t *next_pgd = pt_view_pgd(next, tsk);
 	unsigned long new_lam;
 	struct new_asid ns;
 	u64 next_tlb_gen;
@@ -806,7 +849,8 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 	 * isn't free.
 	 */
 #ifdef CONFIG_DEBUG_VM
-	if (WARN_ON_ONCE(__read_cr3() != build_cr3(prev->pgd, prev_asid,
+	if (WARN_ON_ONCE(__read_cr3() != build_cr3(this_cpu_loaded_pgd(prev),
+						   prev_asid,
 						   tlbstate_lam_cr3_mask()))) {
 		/*
 		 * If we were to BUG here, we'd be very likely to kill
@@ -858,6 +902,18 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 		    WARN_ON_ONCE(prev != &init_mm && !is_notrack_mm(prev) &&
 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
 			cpumask_set_cpu(cpu, mm_cpumask(next));
+
+		/*
+		 * Switching between threads on different page table views:
+		 * load the other page table, flushing what this one cached.
+		 */
+		if (unlikely(this_cpu_loaded_pgd(prev) != next_pgd)) {
+			smp_mb();
+			next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+			ns.asid = prev_asid;
+			ns.need_flush = true;
+			goto reload_tlb;
+		}
 
 		/* Check if the current mm is transitioning to a global ASID */
 		if (mm_needs_global_asid(next, prev_asid)) {
@@ -944,19 +1000,22 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 
 reload_tlb:
 	new_lam = mm_lam_cr3_mask(next);
+	if (asid_pgd_changed(ns.asid, next_pgd))
+		ns.need_flush = true;
 	if (ns.need_flush) {
 		VM_WARN_ON_ONCE(is_global_asid(ns.asid));
 		this_cpu_write(cpu_tlbstate.ctxs[ns.asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[ns.asid].tlb_gen, next_tlb_gen);
-		load_new_mm_cr3(next->pgd, ns.asid, new_lam, true);
+		load_new_mm_cr3(next_pgd, ns.asid, new_lam, true);
 
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 	} else {
 		/* The new ASID is already up to date. */
-		load_new_mm_cr3(next->pgd, ns.asid, new_lam, false);
+		load_new_mm_cr3(next_pgd, ns.asid, new_lam, false);
 
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
+	set_loaded_pgd(ns.asid, next_pgd);
 
 	/* Make sure we write CR3 before loaded_mm. */
 	barrier();
@@ -1089,8 +1148,11 @@ void initialize_tlbstate_and_flush(void)
 	this_cpu_write(cpu_tlbstate.ctxs[0].tlb_gen, tlb_gen);
 	cpu_tlbstate_update_lam(lam, mm_untag_mask(mm));
 
-	for (i = 1; i < TLB_NR_DYN_ASIDS; i++)
+	for (i = 1; i < TLB_NR_DYN_ASIDS; i++) {
 		this_cpu_write(cpu_tlbstate.ctxs[i].ctx_id, 0);
+		set_loaded_pgd(i, NULL);
+	}
+	set_loaded_pgd(0, mm->pgd);
 }
 
 /*
@@ -1398,9 +1460,9 @@ static void init_flush_tlb_info(struct flush_tlb_info *info,
 	info->trim_cpumask	= 0;
 }
 
-void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
-				unsigned long end, unsigned int stride_shift,
-				bool freed_tables)
+static void __flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+				 unsigned long end, unsigned int stride_shift,
+				 bool freed_tables)
 {
 	struct flush_tlb_info info;
 	bool remote_flush = false;
@@ -1438,6 +1500,22 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
 }
+
+void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+				unsigned long end, unsigned int stride_shift,
+				bool freed_tables)
+{
+	/* Page table views are invalidated with the TLB, see pt_views.h */
+	pt_views_zap(mm, start, end);
+	__flush_tlb_mm_range(mm, start, end, stride_shift, freed_tables);
+}
+
+#ifdef CONFIG_MM_PT_VIEWS
+void flush_tlb_mm_keep_views(struct mm_struct *mm)
+{
+	__flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL, false);
+}
+#endif
 
 static void do_flush_tlb_all(void *info)
 {
@@ -1526,7 +1604,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
 unsigned long __get_current_cr3_fast(void)
 {
 	unsigned long cr3 =
-		build_cr3(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd,
+		build_cr3(this_cpu_loaded_pgd(this_cpu_read(cpu_tlbstate.loaded_mm)),
 			  this_cpu_read(cpu_tlbstate.loaded_mm_asid),
 			  tlbstate_lam_cr3_mask());
 
@@ -1739,7 +1817,7 @@ bool nmi_uaccess_okay(void)
 	if (loaded_mm != current_mm)
 		return false;
 
-	VM_WARN_ON_ONCE(__pa(current_mm->pgd) != read_cr3_pa());
+	VM_WARN_ON_ONCE(__pa(this_cpu_loaded_pgd(current_mm)) != read_cr3_pa());
 
 	return true;
 }

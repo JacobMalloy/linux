@@ -1344,6 +1344,10 @@ struct mm_struct {
 #ifdef CONFIG_MMU_NOTIFIER
 		struct mmu_notifier_subscriptions *notifier_subscriptions;
 #endif
+#ifdef CONFIG_MM_PT_VIEWS
+		/* Extra page tables for groups of threads, see pt_views.h */
+		struct mm_pt_views *pt_views;
+#endif
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !defined(CONFIG_SPLIT_PMD_PTLOCKS)
 		pgtable_t pmd_huge_pte; /* protected by page_table_lock */
 #endif

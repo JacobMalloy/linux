@@ -370,6 +370,31 @@ void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 	_pgd_free(mm, pgd);
 }
 
+#ifdef CONFIG_MM_PT_VIEWS
+/*
+ * Like pgd_alloc(), but for a second page table of @mm: the kernel half is
+ * cloned and kept in sync through pgd_list, the user half starts empty.
+ * Only for 64-bit, where nothing is preallocated.
+ */
+pgd_t *pgd_alloc_view(struct mm_struct *mm)
+{
+	pgd_t *pgd = _pgd_alloc(mm);
+
+	if (!pgd)
+		return NULL;
+	spin_lock(&pgd_lock);
+	pgd_ctor(mm, pgd);
+	spin_unlock(&pgd_lock);
+	return pgd;
+}
+
+void pgd_free_view(struct mm_struct *mm, pgd_t *pgd)
+{
+	pgd_dtor(pgd);
+	_pgd_free(mm, pgd);
+}
+#endif
+
 /*
  * Used to set accessed or dirty bits in the page table entries
  * on other architectures. On x86, the accessed and dirty bits

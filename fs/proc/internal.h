@@ -412,6 +412,12 @@ extern const struct file_operations proc_clear_refs_operations;
 extern const struct file_operations proc_pagemap_operations;
 extern const struct file_operations proc_young_bitmap_operations;
 extern const struct file_operations proc_young_bitmap_flush_operations;
+#ifdef CONFIG_MM_PT_VIEWS
+extern const struct file_operations proc_pt_view_young_bitmap_operations;
+extern const struct file_operations proc_pt_view_tasks_operations;
+extern const struct file_operations proc_pt_view_stats_operations;
+extern const struct file_operations proc_pt_view_check_operations;
+#endif
 
 extern unsigned long task_vsize(struct mm_struct *);
 extern unsigned long task_statm(struct mm_struct *,

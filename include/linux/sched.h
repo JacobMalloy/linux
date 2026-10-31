@@ -978,6 +978,10 @@ struct task_struct {
 	struct rb_node			pushable_dl_tasks;
 
 	struct mm_struct		*mm;
+#ifdef CONFIG_MM_PT_VIEWS
+	/* Page table view this thread runs on, NULL for mm->pgd */
+	struct mm_pt_view		*pt_view;
+#endif
 	struct mm_struct		*active_mm;
 
 	struct task_exec_state __rcu	*exec_state;

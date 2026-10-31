@@ -12,6 +12,7 @@
 #include <linux/mman.h>
 #include <linux/reboot.h>
 #include <linux/prctl.h>
+#include <linux/pt_views.h>
 #include <linux/highuid.h>
 #include <linux/fs.h>
 #include <linux/kmod.h>
@@ -2907,6 +2908,31 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg3 & PR_CFI_LOCK && !(arg3 & PR_CFI_DISABLE))
 			error = arch_prctl_lock_branch_landing_pad_state(me);
 		break;
+#ifdef CONFIG_MM_PT_VIEWS
+	case PR_PT_VIEW:
+		if (arg4 || arg5)
+			return -EINVAL;
+		switch (arg2) {
+		case PR_PT_VIEW_CREATE:
+			if (arg3)
+				return -EINVAL;
+			error = me->mm ? mm_pt_view_create(me->mm) : -EINVAL;
+			break;
+		case PR_PT_VIEW_SET:
+			if (arg3 >= MM_PT_VIEWS_MAX)
+				return -EINVAL;
+			error = pt_view_set_current(arg3);
+			break;
+		case PR_PT_VIEW_GET:
+			if (arg3)
+				return -EINVAL;
+			error = me->pt_view ? me->pt_view->id : 0;
+			break;
+		default:
+			error = -EINVAL;
+		}
+		break;
+#endif
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;

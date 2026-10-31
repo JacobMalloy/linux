@@ -8,6 +8,7 @@
 #include <linux/memfd.h>
 #include <linux/memremap.h>
 #include <linux/pagemap.h>
+#include <linux/pt_views.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -1613,6 +1614,9 @@ retry:
 		goto retry;
 	}
 
+	/* The caller retries the access, maybe on a page table view */
+	if (mm == current->mm)
+		pt_view_fixup_fault(mm, address, fault_flags & FAULT_FLAG_WRITE);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(fixup_user_fault);

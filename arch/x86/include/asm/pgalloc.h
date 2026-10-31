@@ -48,6 +48,11 @@ static inline unsigned int pgd_allocation_order(void)
  */
 extern pgd_t *pgd_alloc(struct mm_struct *);
 extern void pgd_free(struct mm_struct *mm, pgd_t *pgd);
+#ifdef CONFIG_MM_PT_VIEWS
+/* A PGD for a page table view of @mm, see pt_views.h; mm->pgd is untouched */
+extern pgd_t *pgd_alloc_view(struct mm_struct *mm);
+extern void pgd_free_view(struct mm_struct *mm, pgd_t *pgd);
+#endif
 
 extern pgtable_t pte_alloc_one(struct mm_struct *);
 

@@ -31,5 +31,6 @@ TEST_GEN_PROGS += proc-multiple-procfs
 TEST_GEN_PROGS += proc-fsconfig-hidepid
 TEST_GEN_PROGS += proc-pidns
 TEST_GEN_PROGS += proc-young-bitmap
+TEST_GEN_PROGS += proc-pt-views
 
 include ../lib.mk

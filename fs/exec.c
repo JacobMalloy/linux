@@ -882,6 +882,10 @@ static int exec_mmap(struct linux_binprm *bprm)
 	active_mm = tsk->active_mm;
 	tsk->active_mm = mm;
 	tsk->mm = mm;
+#ifdef CONFIG_MM_PT_VIEWS
+	/* Page table views belong to the old mm */
+	tsk->pt_view = NULL;
+#endif
 	sched_cache_exec_mmap(tsk, mm);
 	mm_init_cid(mm, tsk);
 	exec_state = task_exec_state_replace(tsk, exec_state);

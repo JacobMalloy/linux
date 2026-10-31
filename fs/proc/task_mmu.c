@@ -16,6 +16,7 @@
 #include <linux/sched/mm.h>
 #include <linux/leafops.h>
 #include <linux/mmu_notifier.h>
+#include <linux/pt_views.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
 #include <linux/uaccess.h>
@@ -2176,10 +2177,12 @@ static const struct mm_walk_ops young_bitmap_ops = {
  * YOUNG_BITMAP_CHUNK bytes, starting at virtual page @pos.
  */
 static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
-			       size_t count, loff_t *ppos, bool write)
+			       size_t count, loff_t *ppos, bool write,
+			       int view_id)
 {
 	struct mm_struct *mm = file->private_data;
 	struct young_bitmap_walk yw = { .select = write };
+	struct mm_pt_view *view = NULL;
 	unsigned long start, end, npages;
 	ssize_t done = 0;
 	size_t len;
@@ -2190,6 +2193,15 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 
 	if (!count || *ppos < 0 || *ppos > (ULONG_MAX >> PAGE_SHIFT))
 		goto out_mm;
+
+#ifdef CONFIG_MM_PT_VIEWS
+	if (view_id) {
+		ret = -ENOENT;
+		view = mm_pt_view_get(mm, view_id);
+		if (!view)
+			goto out_mm;
+	}
+#endif
 
 	yw.bitmap = kmalloc(YOUNG_BITMAP_CHUNK, GFP_KERNEL);
 	ret = -ENOMEM;
@@ -2210,7 +2222,7 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 	 * flush to drop cached PMD entries, and misses secondary MMU accesses.
 	 */
 	yw.skip_pmd = !write && yw.flush && !yw.notifiers &&
-		      arch_has_hw_nonleaf_pmd_young();
+		      arch_has_hw_nonleaf_pmd_young() && !view;
 	yw.pmd_cleared = -1UL;
 	yw.read_start = start;
 	yw.read_end = mm->task_size;
@@ -2239,8 +2251,16 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 			ret = mmap_read_lock_killable(mm);
 			if (ret)
 				break;
-			ret = walk_page_range(mm, start, end,
-					      &young_bitmap_ops, &yw);
+#ifdef CONFIG_MM_PT_VIEWS
+			if (view) {
+				/* Views have no secondary MMUs or huge entries */
+				if (pt_view_young(view, start, end, yw.bitmap,
+						  write))
+					yw.cleared = true;
+			} else
+#endif
+				ret = walk_page_range(mm, start, end,
+						      &young_bitmap_ops, &yw);
 			mmap_read_unlock(mm);
 			if (ret)
 				break;
@@ -2259,8 +2279,9 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 		start = end;
 	}
 
+	/* Only accessed bits changed: page table views stay valid */
 	if (yw.flush && yw.cleared)
-		flush_tlb_mm(mm);
+		flush_tlb_mm_keep_views(mm);
 
 	*ppos += (loff_t)done * BITS_PER_BYTE;
 	if (done)
@@ -2276,13 +2297,13 @@ out_mm:
 static ssize_t young_bitmap_read(struct file *file, char __user *buf,
 				 size_t count, loff_t *ppos)
 {
-	return young_bitmap_rw(file, buf, count, ppos, false);
+	return young_bitmap_rw(file, buf, count, ppos, false, 0);
 }
 
 static ssize_t young_bitmap_write(struct file *file, const char __user *buf,
 				  size_t count, loff_t *ppos)
 {
-	return young_bitmap_rw(file, (char __user *)buf, count, ppos, true);
+	return young_bitmap_rw(file, (char __user *)buf, count, ppos, true, 0);
 }
 
 static int __young_bitmap_open(struct inode *inode, struct file *file,
@@ -2374,6 +2395,195 @@ const struct file_operations proc_young_bitmap_flush_operations = {
 	.open		= young_bitmap_flush_open,
 	.release	= young_bitmap_release,
 };
+
+#ifdef CONFIG_MM_PT_VIEWS
+/*
+ * Files in /proc/<pid>/pt_views/<n>/, see pt_views.h.  The directory keeps
+ * the view id in the fd field of its proc_inode.
+ */
+static int pt_view_file_id(const struct file *file)
+{
+	return PROC_I(d_inode(file->f_path.dentry->d_parent))->fd;
+}
+
+/* young_bitmap, for the threads of one view only */
+static ssize_t pt_view_young_bitmap_read(struct file *file, char __user *buf,
+					 size_t count, loff_t *ppos)
+{
+	return young_bitmap_rw(file, buf, count, ppos, false,
+			       pt_view_file_id(file));
+}
+
+static ssize_t pt_view_young_bitmap_write(struct file *file,
+					  const char __user *buf,
+					  size_t count, loff_t *ppos)
+{
+	return young_bitmap_rw(file, (char __user *)buf, count, ppos, true,
+			       pt_view_file_id(file));
+}
+
+const struct file_operations proc_pt_view_young_bitmap_operations = {
+	.llseek		= mem_lseek,
+	.read		= pt_view_young_bitmap_read,
+	.write		= pt_view_young_bitmap_write,
+	.open		= young_bitmap_open,
+	.release	= young_bitmap_release,
+};
+
+/* tasks: the thread ids on the view; writing a thread id moves it there */
+static int pt_view_tasks_show(struct seq_file *m, void *v)
+{
+	struct mm_struct *mm = m->private;
+	int id = pt_view_file_id(m->file);
+	struct task_struct *task, *t;
+	struct mm_pt_view *view;
+
+	task = get_proc_task(file_inode(m->file));
+	if (!task)
+		return -ESRCH;
+	rcu_read_lock();
+	for_each_thread(task, t) {
+		view = READ_ONCE(t->pt_view);
+		if (READ_ONCE(t->mm) != mm)
+			continue;
+		if ((view && view->mm == mm ? view->id : 0) == id)
+			seq_printf(m, "%d\n", task_pid_vnr(t));
+	}
+	rcu_read_unlock();
+	put_task_struct(task);
+	return 0;
+}
+
+static int pt_view_tasks_open(struct inode *inode, struct file *file)
+{
+	struct mm_struct *mm;
+	int ret;
+
+	mm = proc_mem_open(inode, (file->f_mode & FMODE_WRITE) ?
+			   PTRACE_MODE_ATTACH : PTRACE_MODE_READ);
+	if (IS_ERR_OR_NULL(mm))
+		return mm ? PTR_ERR(mm) : -ESRCH;
+	ret = single_open(file, pt_view_tasks_show, mm);
+	if (ret)
+		mmdrop(mm);
+	return ret;
+}
+
+static ssize_t pt_view_tasks_write(struct file *file, const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	struct mm_struct *mm = ((struct seq_file *)file->private_data)->private;
+	struct task_struct *t;
+	pid_t tid;
+	int ret;
+
+	ret = kstrtoint_from_user(buf, count, 10, &tid);
+	if (ret)
+		return ret;
+	rcu_read_lock();
+	t = find_task_by_vpid(tid);
+	if (t)
+		get_task_struct(t);
+	rcu_read_unlock();
+	if (!t)
+		return -ESRCH;
+	ret = -EINVAL;
+	if (READ_ONCE(t->mm) == mm)
+		ret = pt_view_move_task(t, mm, pt_view_file_id(file));
+	put_task_struct(t);
+	return ret ? ret : count;
+}
+
+static int pt_view_tasks_release(struct inode *inode, struct file *file)
+{
+	mmdrop(((struct seq_file *)file->private_data)->private);
+	return single_release(inode, file);
+}
+
+const struct file_operations proc_pt_view_tasks_operations = {
+	.open		= pt_view_tasks_open,
+	.read		= seq_read,
+	.write		= pt_view_tasks_write,
+	.llseek		= seq_lseek,
+	.release	= pt_view_tasks_release,
+};
+
+/*
+ * stats: counters of the view.  check: the number of view entries that
+ * disagree with view 0, which must be 0 whenever no page table of the
+ * process is being changed.  For testing.
+ */
+static int pt_view_stats_show(struct seq_file *m, void *v)
+{
+	struct mm_struct *mm = m->private;
+	struct mm_pt_view *view = mm_pt_view_get(mm, pt_view_file_id(m->file));
+
+	if (!view)
+		return 0;
+	seq_printf(m, "fills %ld\nprimary_faults %ld\natomic_fills %ld\n"
+		   "atomic_misses %ld\nzap_calls %ld\nzapped %ld\n",
+		   atomic_long_read(&view->fills),
+		   atomic_long_read(&view->primary_faults),
+		   atomic_long_read(&view->atomic_fills),
+		   atomic_long_read(&view->atomic_misses),
+		   atomic_long_read(&view->zap_calls),
+		   atomic_long_read(&view->zapped));
+	return 0;
+}
+
+static int pt_view_check_show(struct seq_file *m, void *v)
+{
+	struct mm_struct *mm = m->private;
+	struct mm_pt_view *view = mm_pt_view_get(mm, pt_view_file_id(m->file));
+	long bad = 0;
+
+	if (view && mmget_not_zero(mm)) {
+		bad = pt_view_check(view);
+		mmput(mm);
+	}
+	seq_printf(m, "%ld\n", bad);
+	return 0;
+}
+
+static int pt_view_seq_open(struct inode *inode, struct file *file,
+			    int (*show)(struct seq_file *, void *))
+{
+	struct mm_struct *mm;
+	int ret;
+
+	mm = proc_mem_open(inode, PTRACE_MODE_READ);
+	if (IS_ERR_OR_NULL(mm))
+		return mm ? PTR_ERR(mm) : -ESRCH;
+	ret = single_open(file, show, mm);
+	if (ret)
+		mmdrop(mm);
+	return ret;
+}
+
+static int pt_view_stats_open(struct inode *inode, struct file *file)
+{
+	return pt_view_seq_open(inode, file, pt_view_stats_show);
+}
+
+static int pt_view_check_open(struct inode *inode, struct file *file)
+{
+	return pt_view_seq_open(inode, file, pt_view_check_show);
+}
+
+const struct file_operations proc_pt_view_stats_operations = {
+	.open		= pt_view_stats_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= pt_view_tasks_release,
+};
+
+const struct file_operations proc_pt_view_check_operations = {
+	.open		= pt_view_check_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= pt_view_tasks_release,
+};
+#endif /* CONFIG_MM_PT_VIEWS */
 
 typedef struct {
 	u64 pme;

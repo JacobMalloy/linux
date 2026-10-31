@@ -1179,6 +1179,19 @@ config PAGE_IDLE_FLAG
 	  bit writers can set the state of the bit in the flags so that PTE
 	  Accessed bit readers may avoid disturbance.
 
+config MM_PT_VIEWS
+	bool "Per-thread-group page table views (EXPERIMENTAL)"
+	depends on X86_64 && PROC_PAGE_MONITOR && !XEN_PV
+	help
+	  Lets a process create extra page tables ("views") of its own
+	  address space and move threads onto them.  A view is a cache of
+	  the process's page tables that is filled on demand from page
+	  faults and invalidated together with the TLB, so the accessed bits
+	  in a view record only the accesses of the threads running on it.
+	  /proc/<pid>/pt_views/<n>/young_bitmap reports them.
+
+	  This is a research prototype.  If unsure, say N.
+
 config IDLE_PAGE_TRACKING
 	bool "Enable idle page tracking"
 	depends on SYSFS && MMU

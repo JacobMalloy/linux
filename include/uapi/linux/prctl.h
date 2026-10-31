@@ -416,4 +416,18 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/*
+ * Page table views (CONFIG_MM_PT_VIEWS): extra page tables of the
+ * process's address space whose accessed bits record only the accesses of
+ * the threads running on them.  View 0 is the process's own page table.
+ *
+ * PR_PT_VIEW_CREATE returns the id of a new view.  PR_PT_VIEW_SET moves
+ * the calling thread onto view arg3, PR_PT_VIEW_GET returns its view.
+ * See /proc/<pid>/pt_views/.
+ */
+#define PR_PT_VIEW			0x50545657
+# define PR_PT_VIEW_CREATE		0
+# define PR_PT_VIEW_SET			1
+# define PR_PT_VIEW_GET			2
+
 #endif /* _LINUX_PRCTL_H */
