@@ -81,6 +81,7 @@ int mm_pt_view_create(struct mm_struct *mm, int id);
 int pt_view_set_current(int id);
 int pt_view_move_task(struct task_struct *tsk, struct mm_struct *mm, int id);
 void mm_pt_views_free(struct mm_struct *mm);
+void pt_views_sync_ldt(struct mm_struct *mm);
 
 void __pt_views_zap(struct mm_struct *mm, unsigned long start,
 		    unsigned long end);
@@ -121,6 +122,7 @@ static inline bool mm_has_pt_views(struct mm_struct *mm) { return false; }
 static inline void pt_views_zap(struct mm_struct *mm, unsigned long start,
 				unsigned long end) { }
 static inline void mm_pt_views_free(struct mm_struct *mm) { }
+static inline void pt_views_sync_ldt(struct mm_struct *mm) { }
 static inline void pt_view_fixup_fault(struct mm_struct *mm,
 				       unsigned long address, bool write) { }
 static inline bool pt_view_fault_atomic(struct mm_struct *mm,

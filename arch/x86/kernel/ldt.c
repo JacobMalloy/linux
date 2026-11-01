@@ -17,6 +17,7 @@
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <linux/pt_views.h>
 #include <linux/smp.h>
 #include <linux/syscalls.h>
 #include <linux/slab.h>
@@ -341,6 +342,8 @@ map_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt, int slot)
 
 	/* Propagate LDT mapping to the user page-table */
 	map_ldt_struct_to_user(mm);
+	/* And to the page table views, which share the page tables */
+	pt_views_sync_ldt(mm);
 
 	ldt->slot = slot;
 	return 0;
@@ -408,6 +411,8 @@ static void free_ldt_pgtables(struct mm_struct *mm)
 	 */
 	tlb_gather_mmu_fullmm(&tlb, mm);
 	free_pgd_range(&tlb, start, end, start, end);
+	/* Unhook the page tables from the views before they are freed */
+	pt_views_sync_ldt(mm);
 	tlb_finish_mmu(&tlb);
 #endif
 }

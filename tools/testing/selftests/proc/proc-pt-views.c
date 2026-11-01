@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <asm/ldt.h>
 #include <linux/futex.h>
 #include <linux/userfaultfd.h>
 #include <poll.h>
@@ -1993,6 +1994,127 @@ static int t_exit(void)
 	return PASS;
 }
 
+/*
+ * A local descriptor table works for threads on views.  With page table
+ * isolation the kernel maps each process's LDT in its page tables, so the
+ * views must share that mapping: loading a segment register from the LDT
+ * reads it through the current page table.
+ */
+static int ldt_set(int entry)
+{
+	struct user_desc d = {
+		.entry_number = entry, .base_addr = 0, .limit = 0xfffff,
+		.seg_32bit = 1, .contents = 0, .read_exec_only = 0,
+		.limit_in_pages = 1, .seg_not_present = 0, .useable = 1,
+	};
+
+	return syscall(SYS_modify_ldt, 1, &d, sizeof(d));
+}
+
+/* Load LDT entry @entry into %es and read it back; 0 if it stuck */
+static int ldt_load(int entry)
+{
+	unsigned short sel = entry << 3 | 4 | 3, got;
+
+	asm volatile("mov %0, %%es" : : "r"(sel));
+	asm volatile("mov %%es, %0" : "=r"(got));
+	return got != sel;
+}
+
+static void do_ldt_load(void *p)
+{
+	*(int *)p = ldt_load(0);
+}
+
+static void do_ldt_add(void *p)
+{
+	int *ret = p;
+
+	/* A new LDT, in the other slot, set up from a thread on a view */
+	*ret = ldt_set(1) || ldt_load(1) || ldt_load(0);
+}
+
+static volatile int ldt_stop;
+
+static void do_ldt_spin(void *p)
+{
+	int *bad = p;
+
+	/* Context switches with another view on this CPU keep the LDT */
+	while (!ldt_stop) {
+		sched_yield();
+		*bad |= ldt_load(1);
+	}
+}
+
+static void *ldt_spinner(void *p)
+{
+	struct vjob *job = p;
+
+	vthread(job);
+	return NULL;
+}
+
+static void ldt_child(int early)
+{
+	int view, ret = -1, bad = 0;
+	struct vjob job;
+	cpu_set_t cpus;
+	pthread_t t;
+
+	CPU_ZERO(&cpus);
+	CPU_SET(0, &cpus);
+	sched_setaffinity(0, sizeof(cpus), &cpus);
+	if (early && ldt_set(0))
+		_exit(10);
+	view = view_create();
+	if (!early && ldt_set(0))
+		_exit(10);
+	in_view(view, do_ldt_load, &ret);
+	if (ret)
+		_exit(11);
+	in_view(view, do_ldt_add, &ret);
+	if (ret)
+		_exit(12);
+	job = (struct vjob){ view, do_ldt_spin, &bad };
+	pthread_create(&t, NULL, ldt_spinner, &job);
+	for (int i = 0; i < 2000; i++) {
+		sched_yield();
+		bad |= ldt_load(1);
+	}
+	ldt_stop = 1;
+	pthread_join(t, NULL);
+	if (bad)
+		_exit(13);
+	/* Exit with the LDT and a thread still on the view */
+	job = (struct vjob){ view, do_ldt_spin, &bad };
+	ldt_stop = 0;
+	pthread_create(&t, NULL, ldt_spinner, &job);
+	usleep(10000);
+	exit(0);
+}
+
+static int t_ldt(void)
+{
+	int status;
+	pid_t pid;
+
+	if (ldt_set(0) && errno == ENOSYS) {
+		note("no modify_ldt (CONFIG_MODIFY_LDT_SYSCALL=n)");
+		return SKIP;
+	}
+	for (int round = 0; round < 6; round++) {
+		pid = fork();
+		if (!pid)
+			ldt_child(round & 1);
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		      "%s view: status %#x (exit 10 modify_ldt, 11 load on view, 12 new LDT on view, 13 context switch)",
+		      round & 1 ? "LDT before" : "LDT after", status);
+	}
+	return PASS;
+}
+
 /* Protection keys apply to view threads without any page table change */
 static int pkey_sig;
 
@@ -2140,6 +2262,7 @@ static const struct {
 	{ "young_markers", t_young_markers },
 	{ "many_views", t_many_views },
 	{ "exit", t_exit },
+	{ "ldt", t_ldt },
 	{ "pkeys", t_pkeys },
 	{ "memcg", t_memcg },
 	{ "oom", t_oom },
@@ -2161,7 +2284,7 @@ int main(int argc, char **argv)
 		printf("PT_VIEWS: not supported (%s), skipping\n", strerror(errno));
 		return SKIP;
 	}
-	/* Views can be built in but unusable, e.g. with page table isolation */
+	/* Views can be built in but unusable, e.g. with INVLPGB */
 	if (!(argc > 1 && !strcmp(argv[1], "--no-views"))) {
 		pid_t pid = fork();
 		int status;
@@ -2171,7 +2294,7 @@ int main(int argc, char **argv)
 			      errno : 0);
 		waitpid(pid, &status, 0);
 		if (WIFEXITED(status) && WEXITSTATUS(status) == EOPNOTSUPP) {
-			printf("PT_VIEWS: views unavailable (%s; pti=off?), skipping\n",
+			printf("PT_VIEWS: views unavailable (%s), skipping\n",
 			       strerror(EOPNOTSUPP));
 			return SKIP;
 		}

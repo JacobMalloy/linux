@@ -13,8 +13,8 @@ accesses of its own threads. Combined with
 garbage collector's threads apart from that of the application.
 
 Views are available with ``CONFIG_MM_PT_VIEWS``, on x86-64 only, and not
-with page table isolation (``pti=off``) or broadcast TLB invalidation
-(INVLPGB). This is an experimental feature.
+with broadcast TLB invalidation (INVLPGB), or with page table isolation
+on 5-level paging. This is an experimental feature.
 
 How it works
 ============

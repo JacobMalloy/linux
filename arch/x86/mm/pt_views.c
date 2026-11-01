@@ -44,6 +44,51 @@ struct mm_pt_view *mm_pt_view_get(struct mm_struct *mm, int id)
 	return smp_load_acquire(&views->view[id]);
 }
 
+/*
+ * With PTI, an mm maps its LDT at LDT_BASE_ADDR, in a PGD slot of its own
+ * in both its kernel and its user page table (arch/x86/kernel/ldt.c).  A
+ * view shares those page tables: copy the slot from view 0.  Without PTI
+ * the slot is unused.
+ */
+static void pt_view_copy_ldt(struct mm_pt_view *view)
+{
+	pgd_t *src = pgd_offset(view->mm, LDT_BASE_ADDR);
+	pgd_t *dst = pgd_offset_pgd(view->pgd, LDT_BASE_ADDR);
+	pgd_t pgd = pgdp_get(src);
+
+	if (!boot_cpu_has(X86_FEATURE_PTI))
+		return;
+	set_pgd(dst, pgd);
+	/*
+	 * Freeing the LDT page tables leaves view 0's user slot behind (only
+	 * user addresses are mirrored), so clear the view's by hand.
+	 */
+	set_pgd(kernel_to_user_pgdp(dst),
+		pgd_none(pgd) ? __pgd(0) : pgdp_get(kernel_to_user_pgdp(src)));
+}
+
+/*
+ * Called after view 0's LDT PGD slot is populated or its page tables are
+ * freed (before they are reused), to update the views.
+ */
+void pt_views_sync_ldt(struct mm_struct *mm)
+{
+	struct mm_pt_views *views = smp_load_acquire(&mm->pt_views);
+	struct mm_pt_view *view;
+	int id;
+
+	if (!views)
+		return;
+	/* Against mm_pt_view_create(), which copies the slot under the lock */
+	mutex_lock(&views->lock);
+	for (id = 1; id < MM_PT_VIEWS_MAX; id++) {
+		view = views->view[id];
+		if (view)
+			pt_view_copy_ldt(view);
+	}
+	mutex_unlock(&views->lock);
+}
+
 /* Create view @id, or the lowest free one if @id is 0; returns its id */
 int mm_pt_view_create(struct mm_struct *mm, int id)
 {
@@ -54,12 +99,13 @@ int mm_pt_view_create(struct mm_struct *mm, int id)
 	if (id < 0 || id >= MM_PT_VIEWS_MAX)
 		return -EINVAL;
 	/*
-	 * PTI would need a user copy of every view PGD, and broadcast TLB
-	 * flushing keeps ASIDs valid across CR3 loads, which views rely on to
-	 * not share TLB entries.
+	 * Broadcast TLB flushing keeps ASIDs valid across CR3 loads, which
+	 * views rely on to not share TLB entries.  With PTI and 5-level
+	 * paging, the LDT shares its PGD slot with other kernel mappings,
+	 * so pt_view_copy_ldt() could not share it.
 	 */
-	if (boot_cpu_has(X86_FEATURE_PTI) ||
-	    cpu_feature_enabled(X86_FEATURE_INVLPGB))
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB) ||
+	    (boot_cpu_has(X86_FEATURE_PTI) && pgtable_l5_enabled()))
 		return -EOPNOTSUPP;
 
 	views = smp_load_acquire(&mm->pt_views);
@@ -100,6 +146,7 @@ int mm_pt_view_create(struct mm_struct *mm, int id)
 		kfree(view);
 		goto unlock;
 	}
+	pt_view_copy_ldt(view);
 	smp_store_release(&views->view[id], view);
 	ret = id;
 unlock:
