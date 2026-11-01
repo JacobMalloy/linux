@@ -523,15 +523,36 @@ static int t_create(void)
 	      "mkdir 01");
 	CHECK(rmdir("/proc/self/pt_views/1") && errno == EPERM,
 	      "rmdir: views are not destroyed");
-	pid = fork();
-	if (!pid) {
-		/* Create view 5 in the parent, leaving a gap */
-		snprintf(path, sizeof(path), "/proc/%d/pt_views/5", getppid());
-		_exit(mkdir(path, 0700) ? 1 : 0);
+	/*
+	 * From another process: into a child, since with Yama ptrace_scope=1
+	 * only an ancestor may attach
+	 */
+	{
+		int fds[2];
+		char c;
+
+		if (pipe(fds))
+			die("pipe");
+		pid = fork();
+		if (!pid) {
+			close(fds[1]);
+			/* Wait for the parent, then report whether view 1 exists */
+			if (read(fds[0], &c, 1) < 0)
+				_exit(2);
+			_exit(access("/proc/self/pt_views/1", F_OK) ? 1 : 0);
+		}
+		close(fds[0]);
+		snprintf(path, sizeof(path), "/proc/%d/pt_views/1", pid);
+		CHECK(!mkdir(path, 0700), "mkdir in a child: %m");
+		if (write(fds[1], "x", 1) != 1)
+			die("write");
+		close(fds[1]);
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		      "child does not see the view created for it");
 	}
-	waitpid(pid, &status, 0);
-	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-	      "creating a view from another process");
+	/* Leave a gap for prctl to fill */
+	CHECK(!mkdir("/proc/self/pt_views/5", 0700), "mkdir 5: %m");
 	CHECK(view_create() == 3, "prctl fills the gap");
 	dir = opendir("/proc/self/pt_views");
 	while (dir && (de = readdir(dir))) {
@@ -1080,7 +1101,16 @@ static int t_ksm(void)
 	struct range r = R(buf, n, 0);
 	int id = view_create(), changed = 0;
 	long sharing = 0;
+	/* Restored at exit, for runs on a real system */
+	static const char *const knobs[] = { "run", "sleep_millisecs", "pages_to_scan" };
+	char saved[3][32];
 
+	for (int k = 0; k < 3; k++) {
+		char path[64];
+
+		snprintf(path, sizeof(path), "/sys/kernel/mm/ksm/%s", knobs[k]);
+		snprintf(saved[k], sizeof(saved[k]), "%ld", read_long(path));
+	}
 	if (!try_write_str("/sys/kernel/mm/ksm/run", "1"))
 		return SKIP;
 	try_write_str("/sys/kernel/mm/ksm/sleep_millisecs", "10");
@@ -1096,7 +1126,12 @@ static int t_ksm(void)
 		usleep(50000);
 		sharing = read_long("/sys/kernel/mm/ksm/pages_sharing");
 	}
-	try_write_str("/sys/kernel/mm/ksm/run", "0");
+	for (int k = 2; k >= 0; k--) {
+		char path[64];
+
+		snprintf(path, sizeof(path), "/sys/kernel/mm/ksm/%s", knobs[k]);
+		try_write_str(path, saved[k]);
+	}
 	note("pages_sharing %ld", sharing);
 	if (sharing <= 0)
 		return SKIP;
@@ -2170,6 +2205,9 @@ int main(int argc, char **argv)
 			_exit(failures ? FAIL : ret);
 		}
 		waitpid(pid, &status, 0);
+		/* Empty once the test's processes are gone */
+		rmdir("/sys/fs/cgroup/pt-views-memcg");
+		rmdir("/sys/fs/cgroup/pt-views-oom");
 		ret = WIFEXITED(status) ? WEXITSTATUS(status) : FAIL;
 		if (WIFSIGNALED(status))
 			printf("    killed by signal %d\n", WTERMSIG(status));
