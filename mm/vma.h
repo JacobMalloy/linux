@@ -561,19 +561,6 @@ int split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	      unsigned long addr, int new_below);
 #endif
 
-static inline bool vma_wants_manual_pte_write_upgrade(struct vm_area_struct *vma)
-{
-	/*
-	 * We want to check manually if we can change individual PTEs writable
-	 * if we can't do that automatically for all PTEs in a mapping. For
-	 * private mappings, that's always the case when we have write
-	 * permissions as we properly have to handle COW.
-	 */
-	if (vma->vm_flags & VM_SHARED)
-		return vma_wants_writenotify(vma, vma->vm_page_prot);
-	return !!(vma->vm_flags & VM_WRITE);
-}
-
 #ifdef CONFIG_MMU
 static inline pgprot_t vma_pgprot_modify(pgprot_t oldprot, vma_flags_t vma_flags)
 {
@@ -582,6 +569,28 @@ static inline pgprot_t vma_pgprot_modify(pgprot_t oldprot, vma_flags_t vma_flags
 	return pgprot_modify(oldprot, prot);
 }
 #endif
+
+static inline bool vma_wants_manual_pte_write_upgrade(struct vm_area_struct *vma)
+{
+	/*
+	 * We want to check manually if we can change individual PTEs writable
+	 * if we can't do that automatically for all PTEs in a mapping. For
+	 * private mappings, that's always the case when we have write
+	 * permissions as we properly have to handle COW.
+	 */
+	if (vma->vm_flags & VM_SHARED) {
+		/*
+		 * vma->vm_page_prot is already the write-protected variant if
+		 * writenotify is active. vma_wants_writenotify() expects the
+		 * protection as it is before that downgrade (see
+		 * vma_set_page_prot()), otherwise it takes the "protections
+		 * were changed" exit and ignores uffd-wp and soft-dirty.
+		 */
+		return vma_wants_writenotify(vma,
+				vma_pgprot_modify(vma->vm_page_prot, vma->flags));
+	}
+	return !!(vma->vm_flags & VM_WRITE);
+}
 
 static inline struct vm_area_struct *vma_prev_limit(struct vma_iterator *vmi,
 						    unsigned long min)
