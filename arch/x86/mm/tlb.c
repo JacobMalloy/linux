@@ -1469,6 +1469,13 @@ static void __flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	int cpu = get_cpu();
 	u64 new_tlb_gen;
 
+	/*
+	 * Views map huge pages with 4K entries, which an INVLPG with a huge
+	 * stride would miss.
+	 */
+	if (unlikely(mm_has_pt_views(mm)))
+		stride_shift = PAGE_SHIFT;
+
 	/* This is also a barrier that synchronizes with switch_mm(). */
 	new_tlb_gen = inc_mm_tlb_gen(mm);
 
