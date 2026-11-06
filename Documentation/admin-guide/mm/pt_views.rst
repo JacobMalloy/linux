@@ -23,11 +23,13 @@ The process's own page table is view 0. Every other view starts out empty
 and is filled one entry at a time from the page faults of its threads, by
 copying the translation from view 0 (and having view 0 handle the fault
 first if it lacks one). A view never holds a translation that view 0 does
-not: every TLB flush of a range of the process's address space first
-clears that range from all views. A view therefore behaves like a TLB that
-the hardware walks, and is coherent with view 0 for the same reasons the
-TLB is: the kernel never reuses a page before flushing the TLB entries
-that point to it.
+not: whenever an entry of view 0 is cleared or loses a permission, the same
+range is cleared from all views, at the same time and under the same locks,
+before the TLB flush for the change. A view therefore behaves like a TLB
+that the hardware walks, and is coherent with view 0 for the same reasons
+the TLB is: the kernel never reuses a page before flushing the TLB entries
+that point to it. The cost of clearing views is proportional to what
+changed in view 0, also when the process exits.
 
 Some consequences:
 
@@ -95,8 +97,10 @@ New threads start on the view of the thread that created them.
 ``<n>/stats``
   Counters for view ``n``: entries copied from view 0 (``fills``), faults
   view 0 had to handle first (``primary_faults``), fills from faults with
-  page faults disabled (``atomic_fills``, ``atomic_misses``), and TLB
-  flushes that cleared entries of the view (``zap_calls``, ``zapped``).
+  page faults disabled (``atomic_fills``, ``atomic_misses``), changes to
+  view 0 that cleared entries of the view and the entries they cleared
+  (``zap_calls``, ``zapped``), and, with ``CONFIG_DEBUG_PT_VIEWS``, stale
+  entries found at TLB flushes (``flush_stale``, always 0 without it).
 
 ``<n>/check``
   Reading walks view ``n`` and returns the number of entries that do not

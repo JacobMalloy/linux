@@ -202,9 +202,15 @@ static long view_check(int id)
 	return read_long(view_path(path, id, "check"));
 }
 
+static long view_stat(int id, const char *name);
+
+/* Also stale entries found at TLB flushes, with CONFIG_DEBUG_PT_VIEWS */
 #define CHECK_VIEW(id) do {						\
 	long _bad = view_check(id);					\
+	long _stale = no_views ? 0 : view_stat(id, "flush_stale");	\
 	CHECK(_bad == 0, "view %d has %ld stale entries", id, _bad);	\
+	CHECK(_stale <= 0, "view %d had %ld stale entries at TLB flushes", \
+	      id, _stale);						\
 } while (0)
 
 static long view_stat(int id, const char *name)
@@ -875,20 +881,22 @@ static int t_dontneed(void)
 
 /*
  * A write from a view to a MADV_FREE'd page must mark it dirty in view 0, or
- * reclaim discards it.
+ * reclaim discards it.  With @writable, the view has writable entries when
+ * MADV_FREE cleans view 0, which must not survive.
  */
-static int t_madv_free(void)
+static int madv_free_case(int id, bool writable, uint64_t tag)
 {
 	size_t n = 32;
 	char *buf = map_anon(2 * n * PS, PROT_READ | PROT_WRITE);
 	char *ctl = buf + n * PS;
-	struct range r = R(buf, n, 0xe100);
-	int id = view_create(), lost = 0, kept = 0;
+	struct range r = R(buf, n, tag);
+	int lost = 0, kept = 0;
 
-	fill(buf, 2 * n, 0xe000);
-	in_view(id, do_read, &r);
+	fill(buf, 2 * n, tag - 0x100);
+	in_view(id, writable ? do_fill : do_read, &r);
 	if (madvise(buf, 2 * n * PS, MADV_FREE))
 		return SKIP;
+	r = R(buf, n, tag + 0x100);
 	in_view(id, do_fill, &r);
 	if (madvise(buf, 2 * n * PS, MADV_PAGEOUT))
 		return SKIP;
@@ -899,11 +907,21 @@ static int t_madv_free(void)
 		return SKIP;
 	}
 	for (size_t i = 0; i < n; i++)
-		lost += *word(buf, i) != 0xe100 + i;
-	CHECK(lost == 0, "%d view writes lost to reclaim (%d control pages kept)",
-	      lost, kept);
-	CHECK_VIEW(id);
+		lost += *word(buf, i) != tag + 0x100 + i;
+	CHECK(lost == 0, "%s view entries: %d view writes lost to reclaim (%d control pages kept)",
+	      writable ? "writable" : "read-only", lost, kept);
 	return PASS;
+}
+
+static int t_madv_free(void)
+{
+	int id = view_create();
+	int ret = madv_free_case(id, false, 0xe100);
+
+	if (ret == PASS)
+		ret = madv_free_case(id, true, 0xe400);
+	CHECK_VIEW(id);
+	return ret;
 }
 
 static bool have_swap(void)
@@ -1062,6 +1080,56 @@ static int t_hugetlb(void)
 	CHECK_VIEW(id);
 	unmap_guard(buf, 2 * HPS);
 	CHECK(read_sig_in(id, buf, 4) == SIGSEGV, "after munmap");
+	return PASS;
+}
+
+/*
+ * fork() write-protects private hugetlb pages, and the parent's next write
+ * copies the page: writable view entries for it must be gone by then.
+ */
+static int t_hugetlb_cow(void)
+{
+	size_t n = HPS / PS;
+	char *buf = mmap(NULL, HPS, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	int id, go[2], status;
+	struct range r;
+	pid_t pid;
+
+	if (buf == MAP_FAILED)
+		return SKIP;
+	id = view_create();
+	r = R(buf, n, 0x16000);
+	in_view(id, do_fill, &r);		/* writable view entries */
+	CHECK(r.nsig == 0, "initial writes faulted");
+	if (pipe(go))
+		die("pipe");
+	pid = fork();
+	if (!pid) {
+		char c;
+
+		close(go[1]);
+		if (read(go[0], &c, 1) != 1)
+			_exit(2);
+		for (size_t i = 0; i < n; i++)
+			if (*word(buf, i) != 0x16000 + i)
+				_exit(1);
+		_exit(0);
+	}
+	close(go[0]);
+	r = R(buf, n, 0x17000);
+	in_view(id, do_fill, &r);
+	CHECK(r.nsig == 0, "writes after fork faulted");
+	if (write(go[1], "x", 1) != 1)
+		die("write");
+	close(go[1]);
+	waitpid(pid, &status, 0);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "child saw the parent's view writes: status %#x", status);
+	CHECK(verify_in(0, buf, n, 0x17000) == 0, "view 0 after COW");
+	CHECK(verify_in(id, buf, n, 0x17000) == 0, "view after COW");
+	CHECK_VIEW(id);
+	munmap(buf, HPS);
 	return PASS;
 }
 
@@ -1994,6 +2062,107 @@ static int t_exit(void)
 	return PASS;
 }
 
+static double now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+#define EXIT_SPAN	(16UL << 30)	/* view page tables, one page each */
+#define EXIT_DIRTY	(512UL << 20)	/* dirty shared memory */
+
+/*
+ * Child for t_exit_time(): give a view one entry in each 2M of EXIT_SPAN
+ * (zero pages, so only page tables cost memory), dirty EXIT_DIRTY of a
+ * memfd, which exit_mmap() unmaps with about one TLB flush per 2M, and
+ * exit when told.
+ */
+static pid_t exit_child(bool view, int ready, int go)
+{
+	pid_t pid = fork();
+	char *span, *mem, c;
+	int fd;
+
+	if (pid)
+		return pid;
+	span = mmap(NULL, EXIT_SPAN, PROT_READ,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	fd = memfd_create("pt-views-exit", 0);
+	if (span == MAP_FAILED || fd < 0 || ftruncate(fd, EXIT_DIRTY))
+		_exit(3);
+	mem = mmap(NULL, EXIT_DIRTY, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED)
+		_exit(3);
+	madvise(span, EXIT_SPAN, MADV_NOHUGEPAGE);
+	if (view)
+		view_set(view_create());
+	for (size_t off = 0; off < EXIT_SPAN; off += HPS)
+		(void)*(volatile char *)(span + off);
+	for (size_t off = 0; off < EXIT_DIRTY; off += PS)
+		mem[off] = 1;
+	if (write(ready, "x", 1) != 1 || read(go, &c, 1) != 1)
+		_exit(2);
+	_exit(0);
+}
+
+/* Seconds from telling a child to exit until it is reaped */
+static double exit_seconds(bool view)
+{
+	int ready[2], go[2], status;
+	double t;
+	pid_t pid;
+	char c;
+
+	if (pipe(ready) || pipe(go))
+		die("pipe");
+	pid = exit_child(view, ready[1], go[0]);
+	if (read(ready[0], &c, 1) != 1) {
+		waitpid(pid, &status, 0);
+		note("child failed: status %#x", status);
+		return -1;
+	}
+	t = now();
+	if (write(go[1], "x", 1) != 1)
+		die("write");
+	waitpid(pid, &status, 0);
+	t = now() - t;
+	close(ready[0]);
+	close(ready[1]);
+	close(go[0]);
+	close(go[1]);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? t : -1;
+}
+
+/*
+ * Exit must cost about the same with a view as without one.  Clearing the
+ * whole view at each of exit_mmap()'s TLB flushes made it quadratic: about
+ * 256 flushes times 4M view entries here.
+ */
+static int t_exit_time(void)
+{
+	double with = 1e9, without = 1e9, t;
+
+	if (no_views)
+		return SKIP;
+	for (int i = 0; i < 2; i++) {
+		t = exit_seconds(false);
+		if (t < 0)
+			return SKIP;
+		if (t < without)
+			without = t;
+		t = exit_seconds(true);
+		CHECK(t >= 0, "child with a view failed");
+		if (t >= 0 && t < with)
+			with = t;
+	}
+	note("exit: %.3f s with a view, %.3f s without", with, without);
+	CHECK(with < 2 * without + 0.25, "exit with a view took %.3f s, %.3f s without",
+	      with, without);
+	return PASS;
+}
+
 /*
  * A local descriptor table works for threads on views.  With page table
  * isolation the kernel maps each process's LDT in its page tables, so the
@@ -2250,6 +2419,7 @@ static const struct {
 	{ "swap", t_swap },
 	{ "thp", t_thp },
 	{ "hugetlb", t_hugetlb },
+	{ "hugetlb_cow", t_hugetlb_cow },
 	{ "migrate", t_migrate },
 	{ "ksm", t_ksm },
 	{ "uffd", t_uffd },
@@ -2262,6 +2432,7 @@ static const struct {
 	{ "young_markers", t_young_markers },
 	{ "many_views", t_many_views },
 	{ "exit", t_exit },
+	{ "exit_time", t_exit_time },
 	{ "ldt", t_ldt },
 	{ "pkeys", t_pkeys },
 	{ "memcg", t_memcg },

@@ -8,11 +8,13 @@
  * A view is a second set of page tables for the user half of an mm.  It
  * starts out empty and is filled one PTE at a time from page faults taken
  * by threads running on it, copying the translation from the mm's own page
- * tables (view 0).  It never holds a translation that view 0 does not, and
- * it is invalidated whenever the TLB is: every TLB flush of a range of the
- * mm also clears that range from all views.  A view thus behaves like a TLB
- * that is walked by hardware, and stays coherent for the same reason the
- * TLB does.
+ * tables (view 0).  It never holds a translation that view 0 does not:
+ * whenever view 0 loses a translation or a permission, the helpers that
+ * change its entries (ptep_get_and_clear(), ptep_set_wrprotect(),
+ * pmdp_huge_get_and_clear(), ... in asm/pgtable.h) clear the same range from
+ * all views, under the same locks and before the TLB flush that follows.
+ * A view thus behaves like a TLB that is walked by hardware.  With
+ * CONFIG_DEBUG_PT_VIEWS, TLB flushes check that no stale entry is left.
  *
  * The point is the accessed bits: the hardware sets them in the page tables
  * it walks, so the bits in a view record the accesses of its threads only.
@@ -47,8 +49,9 @@ struct mm_pt_view {
 	atomic_long_t primary_faults;	/* faults view 0 had to handle first */
 	atomic_long_t atomic_fills;	/* fills with page faults disabled */
 	atomic_long_t atomic_misses;	/* ... that could not be done */
-	atomic_long_t zap_calls;	/* TLB flushes that cleared this view */
+	atomic_long_t zap_calls;	/* view 0 changes that cleared entries */
 	atomic_long_t zapped;		/* present PTEs cleared by them */
+	atomic_long_t flush_stale;	/* stale entries found at TLB flushes */
 };
 
 struct mm_pt_views {
@@ -83,15 +86,6 @@ int pt_view_move_task(struct task_struct *tsk, struct mm_struct *mm, int id);
 void mm_pt_views_free(struct mm_struct *mm);
 void pt_views_sync_ldt(struct mm_struct *mm);
 
-void __pt_views_zap(struct mm_struct *mm, unsigned long start,
-		    unsigned long end);
-static inline void pt_views_zap(struct mm_struct *mm, unsigned long start,
-				unsigned long end)
-{
-	if (unlikely(mm_has_pt_views(mm)))
-		__pt_views_zap(mm, start, end);
-}
-
 vm_fault_t pt_view_handle_fault(struct vm_area_struct *vma,
 				unsigned long address, unsigned int flags,
 				struct pt_regs *regs);
@@ -108,19 +102,13 @@ void pt_view_fixup_fault(struct mm_struct *mm, unsigned long address,
  */
 bool pt_view_young(struct mm_pt_view *view, unsigned long start,
 		   unsigned long end, unsigned long *bitmap, bool select);
-/* Flush the hardware TLBs of @mm without clearing its views */
-void flush_tlb_mm_keep_views(struct mm_struct *mm);
 /* Number of view entries that disagree with view 0, for testing */
 long pt_view_check(struct mm_pt_view *view);
 
 #else /* !CONFIG_MM_PT_VIEWS */
 
-#define flush_tlb_mm_keep_views(mm)	flush_tlb_mm(mm)
-
 static inline struct mm_pt_view *pt_view_current(void) { return NULL; }
 static inline bool mm_has_pt_views(struct mm_struct *mm) { return false; }
-static inline void pt_views_zap(struct mm_struct *mm, unsigned long start,
-				unsigned long end) { }
 static inline void mm_pt_views_free(struct mm_struct *mm) { }
 static inline void pt_views_sync_ldt(struct mm_struct *mm) { }
 static inline void pt_view_fixup_fault(struct mm_struct *mm,

@@ -20,6 +20,7 @@
  * View page tables are only freed with the mm, so walking them needs no
  * lock but the PTE lock of the table being changed.
  */
+#include <linux/hugetlb.h>
 #include <linux/mm.h>
 #include <linux/pt_views.h>
 #include <linux/sched/mm.h>
@@ -30,8 +31,8 @@
 #include <asm/tlbflush.h>
 
 /*
- * View PTE locks are taken while view 0 page table locks are held (by the
- * TLB flush that clears views), so they need their own lockdep class.
+ * View PTE locks are taken while view 0 page table locks are held (by
+ * __pt_views_zap()), so they need their own lockdep class.
  */
 static struct lock_class_key pt_view_ptl_key;
 
@@ -598,7 +599,7 @@ static long pt_view_walk(struct mm_pt_view *view, unsigned long addr,
 	return n;
 }
 
-/* Clamp a TLB flush range to the user address space; false if empty */
+/* Clamp a range to the user address space; false if empty */
 static bool pt_view_range(unsigned long *start, unsigned long *end)
 {
 	*start &= PAGE_MASK;
@@ -627,14 +628,23 @@ static long pt_view_zap_ptes(struct mm_pt_view *view, pte_t *pte,
 }
 
 /*
- * Called for every TLB flush of @mm, before the hardware flush, with
- * whatever locks the caller holds for changing view 0.
+ * Clear [start, end) from all views of @mm.  Called (through
+ * pt_views_zap_at()) by the helpers that change view 0's entries, right
+ * after view 0 loses a translation or a permission, with the locks the
+ * change was made under.  That is the same moment and the same locks as
+ * for view 0, which gives the two rules views rely on:
+ * - a concurrent pt_view_fill() either reads the new view 0 entry or copies
+ *   the old one before this takes the view's PTE lock, and is then undone;
+ * - it comes before the TLB flush for the change, so CPUs on a view cannot
+ *   cache the old translation again after the flush, and before the page
+ *   can be freed.
  */
 void __pt_views_zap(struct mm_struct *mm, unsigned long start,
 		    unsigned long end)
 {
 	struct mm_pt_views *views = smp_load_acquire(&mm->pt_views);
 	struct mm_pt_view *view;
+	long n;
 	int id;
 
 	if (!views || !pt_view_range(&start, &end))
@@ -643,12 +653,53 @@ void __pt_views_zap(struct mm_struct *mm, unsigned long start,
 		view = smp_load_acquire(&views->view[id]);
 		if (!view)
 			continue;
-		atomic_long_inc(&view->zap_calls);
-		atomic_long_add(pt_view_walk(view, start, end,
-					     pt_view_zap_ptes, NULL),
-				&view->zapped);
+		n = pt_view_walk(view, start, end, pt_view_zap_ptes, NULL);
+		if (n) {
+			atomic_long_inc(&view->zap_calls);
+			atomic_long_add(n, &view->zapped);
+		}
 	}
 }
+EXPORT_SYMBOL_GPL(__pt_views_zap);
+
+#ifdef CONFIG_HUGETLB_PAGE
+/*
+ * hugetlb entries are PMD or PUD entries, but views map hugetlb pages with
+ * 4K entries: clear the whole page from them, before the TLB flush.
+ */
+pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
+			      pte_t *ptep, unsigned long sz)
+{
+	pte_t pte = native_ptep_get_and_clear(ptep);
+
+	page_table_check_pte_clear(mm, addr, pte);
+	pt_views_zap_at(mm, addr, sz);
+	return pte;
+}
+
+pte_t huge_ptep_clear_flush(struct vm_area_struct *vma, unsigned long addr,
+			    pte_t *ptep)
+{
+	unsigned long sz = huge_page_size(hstate_vma(vma));
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t pte = huge_ptep_get_and_clear(mm, addr, ptep, sz);
+
+	/* All of it: views have the page in their TLBs as 4K entries */
+	if (pte_accessible(mm, pte))
+		flush_tlb_range(vma, addr & ~(sz - 1), (addr & ~(sz - 1)) + sz);
+	return pte;
+}
+
+void huge_ptep_set_wrprotect(struct mm_struct *mm, unsigned long addr,
+			     pte_t *ptep)
+{
+	pud_t *pud = pud_offset(p4d_offset(pgd_offset(mm, addr), addr), addr);
+
+	ptep_set_wrprotect(mm, addr, ptep);
+	/* The entry is present: a PUD leaf or one in a PMD table */
+	pt_views_zap_at(mm, addr, pud_leaf(pudp_get(pud)) ? PUD_SIZE : PMD_SIZE);
+}
+#endif
 
 struct pt_view_young_arg {
 	unsigned long start;
@@ -706,6 +757,7 @@ bool pt_view_young(struct mm_pt_view *view, unsigned long start,
 static long pt_view_check_ptes(struct mm_pt_view *view, pte_t *pte,
 			       unsigned long addr, unsigned long end, void *arg)
 {
+	bool at_flush = arg;
 	pte_t src, cur;
 	long bad = 0;
 
@@ -719,7 +771,13 @@ static long pt_view_check_ptes(struct mm_pt_view *view, pte_t *pte,
 		     (pte_flags(src) & (_PAGE_RW | _PAGE_DIRTY)) ==
 		     (_PAGE_RW | _PAGE_DIRTY)))
 			continue;
-		if (bad++ < 4)
+		if (bad++ >= 4)
+			continue;
+		if (at_flush)
+			WARN_ONCE(1, "pt_view %d: stale entry at %#lx at TLB flush: view %#lx, view 0 %#lx\n",
+				  view->id, addr, (unsigned long)pte_val(cur),
+				  (unsigned long)pte_val(src));
+		else
 			pr_warn("pt_view %d: stale entry at %#lx: view %#lx, view 0 %#lx\n",
 				view->id, addr, (unsigned long)pte_val(cur),
 				(unsigned long)pte_val(src));
@@ -731,6 +789,35 @@ long pt_view_check(struct mm_pt_view *view)
 {
 	return pt_view_walk(view, 0, TASK_SIZE_MAX, pt_view_check_ptes, NULL);
 }
+
+#ifdef CONFIG_DEBUG_PT_VIEWS
+/*
+ * Called for ranged TLB flushes of @mm, after view 0 changed and before
+ * the hardware flush: the views must already be clear of the change.
+ * Flushes of the whole mm are skipped, as checking them would make exit
+ * quadratic again.  A racing change elsewhere in the range, between its
+ * view 0 update and its zap, can be reported too.
+ */
+void __pt_views_check_flush(struct mm_struct *mm, unsigned long start,
+			    unsigned long end)
+{
+	struct mm_pt_views *views = smp_load_acquire(&mm->pt_views);
+	struct mm_pt_view *view;
+	int id;
+
+	if (!views || end == TLB_FLUSH_ALL || !atomic_read(&mm->mm_users) ||
+	    !pt_view_range(&start, &end))
+		return;
+	for (id = 1; id < MM_PT_VIEWS_MAX; id++) {
+		view = smp_load_acquire(&views->view[id]);
+		if (view)
+			atomic_long_add(pt_view_walk(view, start, end,
+						     pt_view_check_ptes,
+						     (void *)1),
+					&view->flush_stale);
+	}
+}
+#endif
 
 /* Free the user half of a view's page tables; no CPU may be using it */
 static void pt_view_free_tables(struct mm_pt_view *view)

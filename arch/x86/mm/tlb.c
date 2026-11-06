@@ -1460,21 +1460,25 @@ static void init_flush_tlb_info(struct flush_tlb_info *info,
 	info->trim_cpumask	= 0;
 }
 
-static void __flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
-				 unsigned long end, unsigned int stride_shift,
-				 bool freed_tables)
+void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+				unsigned long end, unsigned int stride_shift,
+				bool freed_tables)
 {
 	struct flush_tlb_info info;
 	bool remote_flush = false;
-	int cpu = get_cpu();
 	u64 new_tlb_gen;
+	int cpu;
 
-	/*
-	 * Views map huge pages with 4K entries, which an INVLPG with a huge
-	 * stride would miss.
-	 */
-	if (unlikely(mm_has_pt_views(mm)))
+	if (unlikely(mm_has_pt_views(mm))) {
+		/*
+		 * Views map huge pages with 4K entries, which an INVLPG
+		 * with a huge stride would miss.
+		 */
 		stride_shift = PAGE_SHIFT;
+		pt_views_check_flush(mm, start, end);
+	}
+
+	cpu = get_cpu();
 
 	/* This is also a barrier that synchronizes with switch_mm(). */
 	new_tlb_gen = inc_mm_tlb_gen(mm);
@@ -1507,22 +1511,6 @@ static void __flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
 }
-
-void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
-				unsigned long end, unsigned int stride_shift,
-				bool freed_tables)
-{
-	/* Page table views are invalidated with the TLB, see pt_views.h */
-	pt_views_zap(mm, start, end);
-	__flush_tlb_mm_range(mm, start, end, stride_shift, freed_tables);
-}
-
-#ifdef CONFIG_MM_PT_VIEWS
-void flush_tlb_mm_keep_views(struct mm_struct *mm)
-{
-	__flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL, false);
-}
-#endif
 
 static void do_flush_tlb_all(void *info)
 {

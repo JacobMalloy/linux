@@ -1235,12 +1235,37 @@ bool ptep_test_and_clear_young(struct vm_area_struct *vma,
 bool ptep_clear_flush_young(struct vm_area_struct *vma,
 		unsigned long address, pte_t *ptep);
 
+#ifdef CONFIG_MM_PT_VIEWS
+void __pt_views_zap(struct mm_struct *mm, unsigned long start,
+		    unsigned long end);
+
+/*
+ * View 0 of @mm (its own page tables) lost the translation or a permission
+ * for the @size bytes around @addr: clear them from the page table views of
+ * @mm as well, after the change and under the same locks, see pt_views.h.
+ */
+static __always_inline void pt_views_zap_at(struct mm_struct *mm,
+					    unsigned long addr,
+					    unsigned long size)
+{
+	if (unlikely(READ_ONCE(mm->pt_views)))
+		__pt_views_zap(mm, addr & ~(size - 1),
+			       (addr & ~(size - 1)) + size);
+}
+#else
+static __always_inline void pt_views_zap_at(struct mm_struct *mm,
+					    unsigned long addr,
+					    unsigned long size) { }
+#endif
+#define pt_views_zap_at pt_views_zap_at
+
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 				       pte_t *ptep)
 {
 	pte_t pte = native_ptep_get_and_clear(ptep);
 	page_table_check_pte_clear(mm, addr, pte);
+	pt_views_zap_at(mm, addr, PAGE_SIZE);
 	return pte;
 }
 
@@ -1257,6 +1282,7 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 		 */
 		pte = native_local_ptep_get_and_clear(ptep);
 		page_table_check_pte_clear(mm, addr, pte);
+		pt_views_zap_at(mm, addr, PAGE_SIZE);
 	} else {
 		pte = ptep_get_and_clear(mm, addr, ptep);
 	}
@@ -1278,6 +1304,7 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
 	do {
 		new_pte = pte_wrprotect(old_pte);
 	} while (!try_cmpxchg((long *)&ptep->pte, (long *)&old_pte, *(long *)&new_pte));
+	pt_views_zap_at(mm, addr, PAGE_SIZE);
 }
 
 /*
@@ -1320,6 +1347,8 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm, unsigned long 
 	pmd_t pmd = native_pmdp_get_and_clear(pmdp);
 
 	page_table_check_pmd_clear(mm, addr, pmd);
+	/* Also for a PMD pointing to a PTE table, see pmdp_collapse_flush() */
+	pt_views_zap_at(mm, addr, PMD_SIZE);
 
 	return pmd;
 }
@@ -1331,6 +1360,7 @@ static inline pud_t pudp_huge_get_and_clear(struct mm_struct *mm,
 	pud_t pud = native_pudp_get_and_clear(pudp);
 
 	page_table_check_pud_clear(mm, addr, pud);
+	pt_views_zap_at(mm, addr, PUD_SIZE);
 
 	return pud;
 }
@@ -1350,6 +1380,7 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
 	do {
 		new_pmd = pmd_wrprotect(old_pmd);
 	} while (!try_cmpxchg((long *)pmdp, (long *)&old_pmd, *(long *)&new_pmd));
+	pt_views_zap_at(mm, addr, PMD_SIZE);
 }
 
 #ifndef pmdp_establish
@@ -1357,14 +1388,18 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
 static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
 		unsigned long address, pmd_t *pmdp, pmd_t pmd)
 {
+	pmd_t old;
+
 	page_table_check_pmd_set(vma->vm_mm, address, pmdp, pmd);
 	if (IS_ENABLED(CONFIG_SMP)) {
-		return xchg(pmdp, pmd);
+		old = xchg(pmdp, pmd);
 	} else {
-		pmd_t old = *pmdp;
+		old = *pmdp;
 		WRITE_ONCE(*pmdp, pmd);
-		return old;
 	}
+	/* Used to invalidate or downgrade, see pmdp_invalidate() */
+	pt_views_zap_at(vma->vm_mm, address, PMD_SIZE);
+	return old;
 }
 #endif
 
@@ -1372,14 +1407,17 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
 static inline pud_t pudp_establish(struct vm_area_struct *vma,
 		unsigned long address, pud_t *pudp, pud_t pud)
 {
+	pud_t old;
+
 	page_table_check_pud_set(vma->vm_mm, address, pudp, pud);
 	if (IS_ENABLED(CONFIG_SMP)) {
-		return xchg(pudp, pud);
+		old = xchg(pudp, pud);
 	} else {
-		pud_t old = *pudp;
+		old = *pudp;
 		WRITE_ONCE(*pudp, pud);
-		return old;
 	}
+	pt_views_zap_at(vma->vm_mm, address, PUD_SIZE);
+	return old;
 }
 #endif
 

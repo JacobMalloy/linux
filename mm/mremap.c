@@ -411,6 +411,7 @@ static bool move_normal_pmd(struct pagetable_move_control *pmc,
 		goto out_unlock;
 	/* Clear the pmd */
 	pmd_clear(old_pmd);
+	pt_views_zap_at(mm, pmc->old_addr, PMD_SIZE);
 	res = true;
 
 	VM_BUG_ON(!pmd_none(*new_pmd));
@@ -464,6 +465,7 @@ static bool move_normal_pud(struct pagetable_move_control *pmc,
 	/* Clear the pud */
 	pud = *old_pud;
 	pud_clear(old_pud);
+	pt_views_zap_at(mm, pmc->old_addr, PUD_SIZE);
 
 	VM_BUG_ON(!pud_none(*new_pud));
 
@@ -511,6 +513,7 @@ static bool move_huge_pud(struct pagetable_move_control *pmc,
 	/* Clear the pud */
 	pud = *old_pud;
 	pud_clear(old_pud);
+	pt_views_zap_at(mm, pmc->old_addr, PUD_SIZE);
 
 	VM_BUG_ON(!pud_none(*new_pud));
 

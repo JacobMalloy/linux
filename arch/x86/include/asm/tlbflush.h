@@ -375,19 +375,28 @@ static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
 	return atomic64_inc_return(&mm->context.tlb_gen);
 }
 
-#ifdef CONFIG_MM_PT_VIEWS
-extern void __pt_views_zap(struct mm_struct *mm, unsigned long start,
-			   unsigned long end);
+#ifdef CONFIG_DEBUG_PT_VIEWS
+extern void __pt_views_check_flush(struct mm_struct *mm, unsigned long start,
+				   unsigned long end);
 #endif
+
+/*
+ * Page table views were cleared when view 0 changed, before the flush:
+ * with CONFIG_DEBUG_PT_VIEWS, check that they hold nothing stale.
+ */
+static inline void pt_views_check_flush(struct mm_struct *mm,
+					unsigned long start, unsigned long end)
+{
+#ifdef CONFIG_DEBUG_PT_VIEWS
+	if (unlikely(READ_ONCE(mm->pt_views)))
+		__pt_views_check_flush(mm, start, end);
+#endif
+}
 
 static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
 		struct mm_struct *mm, unsigned long start, unsigned long end)
 {
-#ifdef CONFIG_MM_PT_VIEWS
-	/* Page table views are invalidated with the TLB, see pt_views.h */
-	if (unlikely(READ_ONCE(mm->pt_views)))
-		__pt_views_zap(mm, start, end);
-#endif
+	pt_views_check_flush(mm, start, end);
 	inc_mm_tlb_gen(mm);
 	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
 	batch->unmapped_pages = true;

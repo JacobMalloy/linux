@@ -1192,6 +1192,20 @@ config MM_PT_VIEWS
 
 	  This is a research prototype.  If unsure, say N.
 
+config DEBUG_PT_VIEWS
+	bool "Check page table views at TLB flushes"
+	depends on MM_PT_VIEWS
+	help
+	  Views are cleared whenever the process's own page tables change.
+	  With this option, every ranged TLB flush of a process with views
+	  also checks that no view entry in the range disagrees with the
+	  process's page tables, warns if one does and counts it in
+	  flush_stale in /proc/<pid>/pt_views/<n>/stats.  This finds
+	  page table changes that bypass the hooks, at a cost.  Flushes of
+	  the whole address space are not checked.
+
+	  If unsure, say N.
+
 config IDLE_PAGE_TRACKING
 	bool "Enable idle page tracking"
 	depends on SYSFS && MMU

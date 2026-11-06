@@ -7047,6 +7047,8 @@ static int __huge_pmd_unshare(struct mmu_gather *tlb,
 	if (check_locks)
 		hugetlb_vma_assert_locked(vma);
 	pud_clear(pud);
+	/* This mm no longer maps the shared PMD table's PUD_SIZE range */
+	pt_views_zap_at(mm, addr, PUD_SIZE);
 
 	tlb_unshare_pmd_ptdesc(tlb, virt_to_ptdesc(ptep), addr);
 

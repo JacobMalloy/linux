@@ -2279,9 +2279,8 @@ static ssize_t young_bitmap_rw(struct file *file, char __user *ubuf,
 		start = end;
 	}
 
-	/* Only accessed bits changed: page table views stay valid */
 	if (yw.flush && yw.cleared)
-		flush_tlb_mm_keep_views(mm);
+		flush_tlb_mm(mm);
 
 	*ppos += (loff_t)done * BITS_PER_BYTE;
 	if (done)
@@ -2521,13 +2520,15 @@ static int pt_view_stats_show(struct seq_file *m, void *v)
 	if (!view)
 		return 0;
 	seq_printf(m, "fills %ld\nprimary_faults %ld\natomic_fills %ld\n"
-		   "atomic_misses %ld\nzap_calls %ld\nzapped %ld\n",
+		   "atomic_misses %ld\nzap_calls %ld\nzapped %ld\n"
+		   "flush_stale %ld\n",
 		   atomic_long_read(&view->fills),
 		   atomic_long_read(&view->primary_faults),
 		   atomic_long_read(&view->atomic_fills),
 		   atomic_long_read(&view->atomic_misses),
 		   atomic_long_read(&view->zap_calls),
-		   atomic_long_read(&view->zapped));
+		   atomic_long_read(&view->zapped),
+		   atomic_long_read(&view->flush_stale));
 	return 0;
 }
 

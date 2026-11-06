@@ -17,6 +17,12 @@
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
 
+#ifndef pt_views_zap_at
+/* Clear a range from the page table views of @mm, see linux/pt_views.h */
+static inline void pt_views_zap_at(struct mm_struct *mm, unsigned long addr,
+				   unsigned long size) { }
+#endif
+
 #if 5 - defined(__PAGETABLE_P4D_FOLDED) - defined(__PAGETABLE_PUD_FOLDED) - \
 	defined(__PAGETABLE_PMD_FOLDED) != CONFIG_PGTABLE_LEVELS
 #error CONFIG_PGTABLE_LEVELS is not consistent with __PAGETABLE_{P4D,PUD,PMD}_FOLDED
@@ -1238,6 +1244,7 @@ static inline void pudp_set_wrprotect(struct mm_struct *mm,
 	pud_t old_pud = *pudp;
 
 	set_pud_at(mm, address, pudp, pud_wrprotect(old_pud));
+	pt_views_zap_at(mm, address, PUD_SIZE);
 }
 #else
 static inline void pudp_set_wrprotect(struct mm_struct *mm,
